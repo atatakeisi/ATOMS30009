@@ -6,16 +6,71 @@
 
 #define TX_PIN   38
 #define CENTER   511
-#define POS_P    614
-#define POS_M    408
 #define MS_MOVE  400
 #define MS_WALK  280
 #define MS_STR   600
 
-const uint8_t GA[] = {0,1,6,7};
-const uint8_t GB[] = {2,3,4,5};
-const uint8_t GL[] = {0,1,4,5};
-const uint8_t GR[] = {2,3,6,7};
+// ============================================================
+// サーボ配置（実機確認済み）
+//   ID 4: 右前・肩   ID 6: 右前・膝
+//   ID 5: 左前・肩   ID 7: 左前・膝
+//   ID 1: 右後・肩   ID 3: 右後・膝
+//   ID 0: 左後・肩   ID 2: 左後・膝
+//
+// 対角グループ（歩行用）
+//   GA = 右前 + 左後  (4,6,0,2)
+//   GB = 左前 + 右後  (5,7,1,3)
+//
+// 肩だけ / 膝だけ グループ
+//   SHOULDER_A = GA の肩 (4,0)
+//   SHOULDER_B = GB の肩 (5,1)
+//   KNEE_A     = GA の膝 (6,2)
+//   KNEE_B     = GB の膝 (7,3)
+// ============================================================
+
+// ── 対角グループ ──────────────────────────────────────────────
+const uint8_t GA[]         = {4,6,0,2};   // 右前+左後（肩+膝）
+const uint8_t GB[]         = {5,7,1,3};   // 左前+右後（肩+膝）
+const uint8_t SHOULDER_A[] = {4,0};       // GAの肩のみ
+const uint8_t SHOULDER_B[] = {5,1};       // GBの肩のみ
+const uint8_t KNEE_A[]     = {6,2};       // GAの膝のみ
+const uint8_t KNEE_B[]     = {7,3};       // GBの膝のみ
+
+// ── 左右グループ（旋回用）────────────────────────────────────
+const uint8_t GL_SH[] = {5,0};   // 左側・肩 (左前5, 左後0)
+const uint8_t GR_SH[] = {4,1};   // 右側・肩 (右前4, 右後1)
+const uint8_t GL_KN[] = {7,2};   // 左側・膝 (左前7, 左後2)
+const uint8_t GR_KN[] = {6,3};   // 右側・膝 (右前6, 右後3)
+
+// ============================================================
+// 物理限界（実機で確認して調整してください）
+// STANDBY値を基準に ±100 を仮設定しています
+// ============================================================
+const int POS_MIN[8] = {
+  276,  // ID0: 左後・肩  (standby 376 - 100)
+  536,  // ID1: 右後・肩  (standby 636 - 100)
+  791,  // ID2: 左後・膝  (standby 891 - 100)
+   36,  // ID3: 右後・膝  (standby 136 - 100)
+  326,  // ID4: 右前・肩  (standby 426 - 100)
+  471,  // ID5: 左前・肩  (standby 571 - 100)
+  821,  // ID6: 右前・膝  (standby 921 - 100)
+   66   // ID7: 左前・膝  (standby 166 - 100)
+};
+const int POS_MAX[8] = {
+  476,  // ID0: 左後・肩  (standby 376 + 100)
+  736,  // ID1: 右後・肩  (standby 636 + 100)
+  991,  // ID2: 左後・膝  (standby 891 + 100)
+  236,  // ID3: 右後・膝  (standby 136 + 100)
+  526,  // ID4: 右前・肩  (standby 426 + 100)
+  671,  // ID5: 左前・肩  (standby 571 + 100)
+ 1023,  // ID6: 右前・膝  (standby 921 + 100、上限1023)
+  266   // ID7: 左前・膝  (standby 166 + 100)
+};
+
+// ── 歩行ストライド量（パルス値）────────────────────────────
+// STANDBY肩値から±この値だけ動かす
+#define STRIDE   60   // 肩の前後ストライド
+#define LIFT     50   // 膝の持ち上げ量
 
 AsyncWebServer server(80);
 AsyncWebSocket  ws("/ws");
@@ -70,9 +125,12 @@ void saveStorage() {
   prefs.end();
 }
 
-// ── 送信 ──────────────────────────────────────────────────────
+// ── 送信（物理限界クランプ付き）──────────────────────────────
 void sendPos(uint8_t id, int pos, int ms) {
-  pos = constrain(pos, 0, 1023);
+  if (id < 8) {
+    pos = constrain(pos, POS_MIN[id], POS_MAX[id]); // 物理限界
+  }
+  pos = constrain(pos, 0, 1023); // 電気的限界（念のため）
   byte msg[13];
   msg[0]=0xFF; msg[1]=0xFF;
   msg[2]=id;   msg[3]=9;
@@ -88,7 +146,7 @@ void sendTorque(uint8_t id, bool enable) {
   byte msg[8];
   msg[0]=0xFF; msg[1]=0xFF;
   msg[2]=id;   msg[3]=4;
-  msg[4]=3;    msg[5]=40;  // TORQUE_ENABLE
+  msg[4]=3;    msg[5]=40;
   msg[6]= enable ? 1 : 0;
   byte sum=0; for(int i=2;i<7;i++) sum+=msg[i]; msg[7]=~sum;
   Serial1.write(msg,8); Serial1.flush();
@@ -97,6 +155,42 @@ void sendTorque(uint8_t id, bool enable) {
 void sendGrp(const uint8_t* ids, int n, int pos, int ms) {
   for (int i=0; i<n; i++) sendPos(ids[i], pos, ms);
 }
+
+// ── スタンバイから相対値で送る ───────────────────────────────
+void sendRelPos(uint8_t id, int offset, int ms) {
+  sendPos(id, (int)standbyPos[id] + offset, ms);
+}
+void sendRelGrp(const uint8_t* ids, int n, int offset, int ms) {
+  for (int i=0; i<n; i++) sendRelPos(ids[i], offset, ms);
+}
+
+// ── 膝の「内側」「外側」方向（サーボ取付向きが左右で逆）────
+// 内側（足を持ち上げる方向）
+//   ID2(左後膝), ID6(右前膝) → +増やすと内側
+//   ID3(右後膝), ID7(左前膝) → -減らすと内側
+void kneeIn(uint8_t id, int amount, int ms) {
+  if (id == 2 || id == 6) sendRelPos(id, -amount, ms);
+  else                     sendRelPos(id, -amount, ms);
+}
+void kneeOut(uint8_t id, int amount, int ms) {
+  if (id == 2 || id == 6) sendRelPos(id, +amount, ms);
+  else                     sendRelPos(id, +amount, ms);
+}
+void kneeStandby(uint8_t id, int ms) { sendRelPos(id, 0, ms); }
+
+// GA膝(ID6,ID2) / GB膝(ID7,ID3) まとめて操作
+void kneeInGA(int v, int ms)  { kneeIn(6,v,ms);  kneeIn(2,v,ms);  }
+void kneeInGB(int v, int ms)  { kneeIn(7,v,ms);  kneeIn(3,v,ms);  }
+void kneeOutGA(int v, int ms) { kneeOut(6,v,ms); kneeOut(2,v,ms); }
+void kneeOutGB(int v, int ms) { kneeOut(7,v,ms); kneeOut(3,v,ms); }
+void kneeStdGA(int ms) { kneeStandby(6,ms); kneeStandby(2,ms); }
+void kneeStdGB(int ms) { kneeStandby(7,ms); kneeStandby(3,ms); }
+
+// 左側膝(ID7,ID2) / 右側膝(ID6,ID3)
+void kneeInGL(int v, int ms)  { kneeIn(7,v,ms);  kneeIn(2,v,ms);  }
+void kneeInGR(int v, int ms)  { kneeIn(6,v,ms);  kneeIn(3,v,ms);  }
+void kneeStdGL(int ms) { kneeStandby(7,ms); kneeStandby(2,ms); }
+void kneeStdGR(int ms) { kneeStandby(6,ms); kneeStandby(3,ms); }
 
 void goStandby() { for(int i=0;i<8;i++) sendPos(i, standbyPos[i], 600); }
 void goStorage()  { for(int i=0;i<8;i++) sendPos(i, storagePos[i], 600); }
@@ -136,7 +230,6 @@ void onWsEvent(AsyncWebSocket* w, AsyncWebSocketClient* cl,
 
   int cfgId, cfgVal;
 
-  // スタンバイ姿勢: 1軸調整 + 即送信
   if (sscanf(buf,"cfg:%d:%d",&cfgId,&cfgVal)==2) {
     if (cfgId>=0&&cfgId<=7&&cfgVal>=0&&cfgVal<=1023) {
       standbyPos[cfgId]=(uint16_t)cfgVal;
@@ -144,7 +237,6 @@ void onWsEvent(AsyncWebSocket* w, AsyncWebSocketClient* cl,
     }
     return;
   }
-  // 収納姿勢: 1軸調整 + 即送信
   if (sscanf(buf,"scfg:%d:%d",&cfgId,&cfgVal)==2) {
     if (cfgId>=0&&cfgId<=7&&cfgVal>=0&&cfgVal<=1023) {
       storagePos[cfgId]=(uint16_t)cfgVal;
@@ -178,8 +270,6 @@ void onWsEvent(AsyncWebSocket* w, AsyncWebSocketClient* cl,
     mode=M_IDLE; goStandby(); pushState(); return;
   }
 
-  // FOLD: 収納姿勢へ移動 → 800ms待機 → トルクOFF
-  // 再押し: トルクON → スタンバイ姿勢
   if (!strcmp(buf,"fold")) {
     if (mode==M_FOLD) {
       sendTorque(0xFE,true); delay(100);
@@ -271,8 +361,6 @@ void setup() {
     h += ".backbtn{width:100%;height:48px;font-size:1.1rem;font-weight:bold;border:none;border-radius:12px;background:#6b7280;color:#fff;cursor:pointer;}";
     h += "#saveMsg{display:block;text-align:center;color:#16a34a;font-weight:bold;min-height:1.4em;margin-bottom:6px;}";
     h += "</style></head><body><div class='c'>";
-
-    // ── メインパネル ──
     h += "<div id='main'><h2>robot0009</h2>";
     h += "<div class='row'><button id='b1' class='btn sw' onclick='tap(1,\"sweep\")'>START</button></div>";
     h += "<div class='row'><button id='b2' class='btn st' onclick='tap(2,\"step\")'>STEP</button><button id='b7' class='btn sx' onclick='tap(7,\"stretch\")'>STRETCH</button></div>";
@@ -282,8 +370,6 @@ void setup() {
     h += "<div class='row'><button id='b0' class='btn sb' onclick='tap(0,\"center\")'>STANDBY</button><button id='b8' class='btn fo' onclick='ws.send(\"fold\")'>FOLD</button></div>";
     h += "<div class='row'><button class='btn co' onclick='openCfg()'>CONFIG</button></div>";
     h += "<div id='st'>Standby | TX: 0</div></div>";
-
-    // ── 設定パネル（タブ: STANDBY / 収納）──
     h += "<div id='cfg' style='display:none'><h3>姿勢設定</h3>";
     h += "<div class='tabs'>";
     h +=   "<button id='tab0' class='tabBtn active' onclick='showTab(0)'>STANDBY</button>";
@@ -295,7 +381,6 @@ void setup() {
     h += "<button class='savebtn' onclick='saveActive()'>NVSに保存</button>";
     h += "<button class='backbtn' onclick='closeCfg()'>戻る</button>";
     h += "</div>";
-
     h += "<script>";
     h += "var ws,cur=0,activeTab=0;";
     h += "var vals=[511,511,511,511,511,511,511,511];";
@@ -303,8 +388,6 @@ void setup() {
     h += "var BID =[null,'b1','b2','b3','b4','b5','b6','b7'];";
     h += "var BCLS=[null,'sw','st','fw','bk','lr','lr','sx'];";
     h += "var BLB =[null,'START','STEP','FWD','BACK','LEFT','RIGHT','STRETCH'];";
-
-    // 共通RowビルダーをJSで生成
     h += "function makeRows(pfx,arr,fn,el){";
     h +=   "var s='';";
     h +=   "for(var i=0;i<8;i++){";
@@ -318,7 +401,6 @@ void setup() {
     h +=   "document.getElementById(el).innerHTML=s;";
     h += "}";
     h += "function buildCfg(){makeRows('sv',vals,'adj','rows0');makeRows('ss',svals,'adjs','rows1');}";
-
     h += "function adj(id,d){";
     h +=   "vals[id]=Math.max(0,Math.min(1023,vals[id]+d));";
     h +=   "document.getElementById('sv'+id).textContent=vals[id];";
@@ -329,7 +411,6 @@ void setup() {
     h +=   "document.getElementById('ss'+id).textContent=svals[id];";
     h +=   "if(ws&&ws.readyState===1)ws.send('scfg:'+id+':'+svals[id]);";
     h += "}";
-
     h += "function showTab(t){";
     h +=   "activeTab=t;";
     h +=   "document.getElementById('panel0').style.display=t===0?'block':'none';";
@@ -337,9 +418,7 @@ void setup() {
     h +=   "document.getElementById('tab0').className='tabBtn'+(t===0?' active':'');";
     h +=   "document.getElementById('tab1').className='tabBtn'+(t===1?' active':'');";
     h += "}";
-
     h += "function saveActive(){if(ws&&ws.readyState===1)ws.send(activeTab===0?'save':'ssave');}";
-
     h += "function openCfg(){";
     h +=   "if(ws&&ws.readyState===1){ws.send('stopall');ws.send('getcfg');ws.send('getscfg');}";
     h +=   "showTab(0);";
@@ -350,7 +429,6 @@ void setup() {
     h +=   "document.getElementById('cfg').style.display='none';";
     h +=   "document.getElementById('main').style.display='block';";
     h += "}";
-
     h += "function upd(m,tx){";
     h +=   "if(cur>0&&cur<=7)document.getElementById(BID[cur]).className='btn '+BCLS[cur];";
     h +=   "document.getElementById('b0').className='btn sb';";
@@ -360,9 +438,7 @@ void setup() {
     h +=   "if(cur===0)document.getElementById('b0').className='btn sb on';";
     h +=   "document.getElementById('st').textContent=(m===0?'Standby':m===8?'FOLD':BLB[m])+' | TX:'+tx;";
     h += "}";
-
     h += "function tap(m,cmd){if(ws&&ws.readyState===1)ws.send(cmd);}";
-
     h += "function connect(){";
     h +=   "ws=new WebSocket('ws://'+location.hostname+'/ws');";
     h +=   "ws.onclose=function(){setTimeout(connect,1000);};";
@@ -398,66 +474,156 @@ void loop() {
   uint8_t m = mode;
 
   switch (m) {
+
+    // ── SWEEP: 動作確認用スイープ ───────────────────────────────
     case M_SWEEP:
-      sendPos(0xFE,POS_P,MS_MOVE);
-      if(!waitM(m,MS_MOVE+200)) break;
-      sendPos(0xFE,CENTER,MS_MOVE);
-      if(!waitM(m,MS_MOVE+200)) break;
-      sendPos(0xFE,POS_M,MS_MOVE);
-      if(!waitM(m,MS_MOVE+200)) break;
-      sendPos(0xFE,CENTER,MS_MOVE);
-      waitM(m,MS_MOVE+200);
+      kneeInGA(LIFT, MS_MOVE);
+      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_MOVE);
+      kneeStdGB(MS_MOVE);
+      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_MOVE);
+      if(!waitM(m, MS_MOVE+200)) break;
+      goStandby();
+      if(!waitM(m, MS_MOVE+200)) break;
+      kneeInGB(LIFT, MS_MOVE);
+      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_MOVE);
+      kneeStdGA(MS_MOVE);
+      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_MOVE);
+      if(!waitM(m, MS_MOVE+200)) break;
+      goStandby();
+      waitM(m, MS_MOVE+200);
       break;
+
+    // ── STEP: 対角2脚交互足踏み ─────────────────────────────────
+    // フェーズ1: GA(右前ID4,6 + 左後ID0,2)
+    //   肩1,5上げ → 膝3,7内側（垂直保持）
+    //   肩1,5下げ → 膝3,7外側
+    //   スタンバイへ
+    // フェーズ2: GB(左前ID5,7 + 右後ID1,3) 同様
     case M_STEP:
-      sendGrp(GA,sizeof(GA),POS_P,MS_WALK);
-      sendGrp(GB,sizeof(GB),CENTER,MS_WALK);
-      if(!waitM(m,MS_WALK+100)) break;
-      sendGrp(GA,sizeof(GA),CENTER,MS_WALK);
-      sendGrp(GB,sizeof(GB),POS_P,MS_WALK);
-      waitM(m,MS_WALK+100);
+      // フェーズ1: GA 持ち上げ（肩上げ＋膝内側）
+      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_WALK);
+      kneeInGA(LIFT, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      // GA 踏み込み（肩下げ＋膝外側）
+      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_WALK);
+      kneeOutGA(LIFT, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      // GA スタンバイへ
+      sendRelGrp(SHOULDER_A, 2, 0, MS_WALK);
+      kneeStdGA(MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      // フェーズ2: GB 持ち上げ（肩上げ＋膝内側）
+      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_WALK);
+      kneeInGB(LIFT, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      // GB 踏み込み（肩下げ＋膝外側）
+      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_WALK);
+      kneeOutGB(LIFT, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      // GB スタンバイへ
+      sendRelGrp(SHOULDER_B, 2, 0, MS_WALK);
+      kneeStdGB(MS_WALK);
+      waitM(m, MS_WALK);
       break;
+
+    // ── FWD: 前進（対角歩行）────────────────────────────────────
     case M_FWD:
-      sendGrp(GA,sizeof(GA),POS_P,MS_WALK);
-      sendGrp(GB,sizeof(GB),POS_M,MS_WALK);
-      if(!waitM(m,MS_WALK+100)) break;
-      sendGrp(GA,sizeof(GA),POS_M,MS_WALK);
-      sendGrp(GB,sizeof(GB),POS_P,MS_WALK);
-      waitM(m,MS_WALK+100);
+      // フェーズ1: GA持ち上げ前へ＋GB蹴り
+      kneeInGA(LIFT, MS_WALK);
+      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_WALK);
+      kneeStdGB(MS_WALK);
+      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      // GA着地
+      kneeStdGA(MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      // フェーズ2: GB持ち上げ前へ＋GA蹴り
+      kneeInGB(LIFT, MS_WALK);
+      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_WALK);
+      kneeStdGA(MS_WALK);
+      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      // GB着地
+      kneeStdGB(MS_WALK);
+      waitM(m, MS_WALK);
       break;
+
+    // ── BACK: 後退（肩方向をFWDの逆に）────────────────────────
     case M_BACK:
-      sendGrp(GA,sizeof(GA),POS_M,MS_WALK);
-      sendGrp(GB,sizeof(GB),POS_P,MS_WALK);
-      if(!waitM(m,MS_WALK+100)) break;
-      sendGrp(GA,sizeof(GA),POS_P,MS_WALK);
-      sendGrp(GB,sizeof(GB),POS_M,MS_WALK);
-      waitM(m,MS_WALK+100);
+      kneeInGA(LIFT, MS_WALK);
+      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_WALK);
+      kneeStdGB(MS_WALK);
+      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      kneeStdGA(MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      kneeInGB(LIFT, MS_WALK);
+      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_WALK);
+      kneeStdGA(MS_WALK);
+      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      kneeStdGB(MS_WALK);
+      waitM(m, MS_WALK);
       break;
+
+    // ── LEFT: 左旋回 ────────────────────────────────────────────
     case M_LEFT:
-      sendGrp(GL,sizeof(GL),POS_M,MS_WALK);
-      sendGrp(GR,sizeof(GR),POS_P,MS_WALK);
-      if(!waitM(m,MS_WALK+150)) break;
-      sendGrp(GL,sizeof(GL),POS_P,MS_WALK);
-      sendGrp(GR,sizeof(GR),POS_M,MS_WALK);
-      waitM(m,MS_WALK+150);
+      // 左側持ち上げ＋後ろへ、右側は前へ
+      kneeInGL(LIFT, MS_WALK);
+      sendRelGrp(GL_SH, 2, -STRIDE, MS_WALK);
+      kneeStdGR(MS_WALK);
+      sendRelGrp(GR_SH, 2, +STRIDE, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      kneeStdGL(MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      // 右側持ち上げ＋後ろへ、左側は前へ
+      kneeInGR(LIFT, MS_WALK);
+      sendRelGrp(GR_SH, 2, -STRIDE, MS_WALK);
+      kneeStdGL(MS_WALK);
+      sendRelGrp(GL_SH, 2, +STRIDE, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      kneeStdGR(MS_WALK);
+      waitM(m, MS_WALK);
       break;
+
+    // ── RIGHT: 右旋回（LEFTの肩方向を逆に）────────────────────
     case M_RIGHT:
-      sendGrp(GL,sizeof(GL),POS_P,MS_WALK);
-      sendGrp(GR,sizeof(GR),POS_M,MS_WALK);
-      if(!waitM(m,MS_WALK+150)) break;
-      sendGrp(GL,sizeof(GL),POS_M,MS_WALK);
-      sendGrp(GR,sizeof(GR),POS_P,MS_WALK);
-      waitM(m,MS_WALK+150);
+      kneeInGR(LIFT, MS_WALK);
+      sendRelGrp(GR_SH, 2, -STRIDE, MS_WALK);
+      kneeStdGL(MS_WALK);
+      sendRelGrp(GL_SH, 2, +STRIDE, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      kneeStdGR(MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      kneeInGL(LIFT, MS_WALK);
+      sendRelGrp(GL_SH, 2, -STRIDE, MS_WALK);
+      kneeStdGR(MS_WALK);
+      sendRelGrp(GR_SH, 2, +STRIDE, MS_WALK);
+      if(!waitM(m, MS_WALK)) break;
+      kneeStdGL(MS_WALK);
+      waitM(m, MS_WALK);
       break;
+
+    // ── STRETCH: 全脚同時に屈伸 ─────────────────────────────────
     case M_STRETCH:
-      sendPos(0xFE,POS_P,MS_STR);
-      if(!waitM(m,MS_STR+400)) break;
-      sendPos(0xFE,CENTER,MS_STR);
-      if(!waitM(m,MS_STR+200)) break;
-      sendPos(0xFE,POS_M,MS_STR);
-      if(!waitM(m,MS_STR+400)) break;
-      sendPos(0xFE,CENTER,MS_STR);
-      waitM(m,MS_STR+200);
+      // 全脚持ち上げ（膝内側＋肩上げ）
+      kneeInGA(LIFT, MS_STR);
+      kneeInGB(LIFT, MS_STR);
+      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_STR);
+      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_STR);
+      if(!waitM(m, MS_STR+200)) break;
+      goStandby();
+      if(!waitM(m, MS_STR+200)) break;
+      // 全脚沈み込み（膝外側＋肩下げ）
+      kneeOutGA(LIFT, MS_STR);
+      kneeOutGB(LIFT, MS_STR);
+      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_STR);
+      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_STR);
+      if(!waitM(m, MS_STR+200)) break;
+      goStandby();
+      waitM(m, MS_STR+200);
       break;
+
     case M_FOLD:
     default:
       delay(20);
