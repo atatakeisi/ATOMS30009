@@ -1,635 +1,1240 @@
-#include <Arduino.h>
+// robot0009 - SCS0009 quadruped (original: ATOM Matrix / M5Atom)
+// ATOMS3 / M5Unified port. Servo TX is GPIO5 (moved from G38 by HW mod),
+// so the internal IMU (MPU6886, SDA=G38/SCL=G39) works together with servos.
 #include <M5Unified.h>
-#include <WiFi.h>
-#include <ESPAsyncWebServer.h>
 #include <Preferences.h>
+#include <Kalman.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
-#define TX_PIN   38
-#define CENTER   511
-#define MS_MOVE  400
-#define MS_WALK  280
-#define MS_STR   600
+#define TX_PIN 5
 
-// ============================================================
-// サーボ配置（実機確認済み）
-//   ID 4: 右前・肩   ID 6: 右前・膝
-//   ID 5: 左前・肩   ID 7: 左前・膝
-//   ID 1: 右後・肩   ID 3: 右後・膝
-//   ID 0: 左後・肩   ID 2: 左後・膝
-//
-// 対角グループ（歩行用）
-//   GA = 右前 + 左後  (4,6,0,2)
-//   GB = 左前 + 右後  (5,7,1,3)
-//
-// 肩だけ / 膝だけ グループ
-//   SHOULDER_A = GA の肩 (4,0)
-//   SHOULDER_B = GB の肩 (5,1)
-//   KNEE_A     = GA の膝 (6,2)
-//   KNEE_B     = GB の膝 (7,3)
-// ============================================================
+WebServer server(80);
+const char ssid[] = "robot0009";  // SSID
+const char pass[] = "password";   // password
+const IPAddress ip(192, 168, 55, 27);      //　IP address
+const IPAddress subnet(255, 255, 255, 0);
 
-// ── 対角グループ ──────────────────────────────────────────────
-const uint8_t GA[]         = {4,6,0,2};   // 右前+左後（肩+膝）
-const uint8_t GB[]         = {5,7,1,3};   // 左前+右後（肩+膝）
-const uint8_t SHOULDER_A[] = {4,0};       // GAの肩のみ
-const uint8_t SHOULDER_B[] = {5,1};       // GBの肩のみ
-const uint8_t KNEE_A[]     = {6,2};       // GAの膝のみ
-const uint8_t KNEE_B[]     = {7,3};       // GBの膝のみ
+Preferences preferences;
 
-// ── 左右グループ（旋回用）────────────────────────────────────
-const uint8_t GL_SH[] = {5,0};   // 左側・肩 (左前5, 左後0)
-const uint8_t GR_SH[] = {4,1};   // 右側・肩 (右前4, 右後1)
-const uint8_t GL_KN[] = {7,2};   // 左側・膝 (左前7, 左後2)
-const uint8_t GR_KN[] = {6,3};   // 右側・膝 (右前6, 右後3)
+//           ID     0    1    2    3    4    5    6    7
+// 実機計測（2026-06-13）：各サーボが水平になる raw が 511+offset。
+// 水平RAW = 476,511,524,504,564,467,526,545 → offset = 水平RAW-511
+int offset[] = { -35,   0,  13,  -7,  53, -44,  15,  34 };
 
-// ============================================================
-// 物理限界（実機で確認して調整してください）
-// STANDBY値を基準に ±100 を仮設定しています
-// ============================================================
-const int POS_MIN[8] = {
-  276,  // ID0: 左後・肩  (standby 376 - 100)
-  536,  // ID1: 右後・肩  (standby 636 - 100)
-  791,  // ID2: 左後・膝  (standby 891 - 100)
-   36,  // ID3: 右後・膝  (standby 136 - 100)
-  326,  // ID4: 右前・肩  (standby 426 - 100)
-  471,  // ID5: 左前・肩  (standby 571 - 100)
-  821,  // ID6: 右前・膝  (standby 921 - 100)
-   66   // ID7: 左前・膝  (standby 166 - 100)
-};
-const int POS_MAX[8] = {
-  476,  // ID0: 左後・肩  (standby 376 + 100)
-  736,  // ID1: 右後・肩  (standby 636 + 100)
-  991,  // ID2: 左後・膝  (standby 891 + 100)
-  236,  // ID3: 右後・膝  (standby 136 + 100)
-  526,  // ID4: 右前・肩  (standby 426 + 100)
-  671,  // ID5: 左前・肩  (standby 571 + 100)
- 1023,  // ID6: 右前・膝  (standby 921 + 100、上限1023)
-  266   // ID7: 左前・膝  (standby 166 + 100)
-};
+// 物理限界（仮値。実機で各サーボの可動域を測って絞り込むこと → TODO）
+const int POS_MIN[8] = {60, 60, 60, 60, 60, 60, 60, 60};
+const int POS_MAX[8] = {960, 960, 960, 960, 960, 960, 960, 960};
 
-// ── 歩行ストライド量（パルス値）────────────────────────────
-// STANDBY肩値から±この値だけ動かす
-#define STRIDE   60   // 肩の前後ストライド
-#define LIFT     50   // 膝の持ち上げ量
+//leg length
+float L1 = 50.0, L2 = 65.0;//unit:mm
 
-AsyncWebServer server(80);
-AsyncWebSocket  ws("/ws");
-const char* ssid = "robot0009";
-const char* pass = "password";
-const IPAddress ip(192,168,55,27);
-const IPAddress subnet(255,255,255,0);
 
-#define M_IDLE    0
-#define M_SWEEP   1
-#define M_STEP    2
-#define M_FWD     3
-#define M_BACK    4
-#define M_LEFT    5
-#define M_RIGHT   6
-#define M_STRETCH 7
-#define M_FOLD    8
+Kalman kalmanX, kalmanY;
+float kalAngleX, kalAngleDotX, kalAngleY, kalAngleDotY;
+unsigned long oldTime = 0, loopTime, nowTime;
+float dt;
+float accX = 0, accY = 0, accZ = 0;
+float gyroX = 0, gyroY = 0, gyroZ = 0;
+float theta_X = 0.0, theta_Y = 0.0;
+float theta_Xdot = 0.0, theta_Ydot = 0.0;
 
-volatile uint8_t mode = M_IDLE;
-unsigned long txCount = 0;
+float hX, hY, hXpre, hYpre;
 
-// ── NVS: スタンバイ姿勢(p0-p7) + 収納姿勢(s0-s7) ────────────
-uint16_t standbyPos[8];
-uint16_t storagePos[8];
-Preferences prefs;
+int pos = 0;
 
-void loadPrefs() {
-  prefs.begin("robot", true);
-  for (int i=0; i<8; i++) {
-    char key[4];
-    snprintf(key,sizeof(key),"p%d",i);
-    standbyPos[i] = prefs.getUShort(key, CENTER);
-    snprintf(key,sizeof(key),"s%d",i);
-    storagePos[i] = prefs.getUShort(key, CENTER);
+
+int Mode;
+// 原作は #define だが、Imu が M5.Imu とマクロ衝突するため定数に変更（値は原作のまま）
+constexpr int L = 1;
+constexpr int R = 2;
+constexpr int Imu = 3;
+constexpr int Jump = 4;
+constexpr int Jump2 = 42;
+constexpr int Step = 5;
+constexpr int Stretch = 6;
+constexpr int Advance = 7;
+constexpr int Back = 8;
+constexpr int Roll = 9;
+constexpr int Calib = 10;   // キャリブレーション（全サーボを角度0=511+offsetで保持）
+
+// キャリブレーション対象サーボ（0..7）
+int calSel = 0;
+
+// IDごとの想定マッピング（実機で検証する）。表示用ラベル。
+const char* servoLabel(int id){
+  switch(id){
+    case 0: return "ID0 RL shoulder";
+    case 1: return "ID1 RR shoulder";
+    case 2: return "ID2 RL knee";
+    case 3: return "ID3 RR knee";
+    case 4: return "ID4 FR shoulder";
+    case 5: return "ID5 FL shoulder";
+    case 6: return "ID6 FR knee";
+    case 7: return "ID7 FL knee";
+    default: return "?";
   }
-  prefs.end();
 }
-void saveStandby() {
-  prefs.begin("robot", false);
-  for (int i=0; i<8; i++) {
-    char key[4]; snprintf(key,sizeof(key),"p%d",i);
-    prefs.putUShort(key, standbyPos[i]);
+
+String modeBtJump = "off";
+String modeBtStep = "off";
+String modeBtImu = "off";
+String modeBtStretch = "off";
+String modeBtAd = "off";
+String modeBtBack = "off";
+String modeBtL = "off";
+String modeBtR = "off";
+String modeBtRoll = "off";
+
+
+//パラメータ
+//-------------------------------------------------
+float wakeUpAngle = -1.0;
+int period = 80, x = 60, height = 40, upHeight = 10, stride = 12;
+float Kp = 0.3, Kd = 0.3;
+// サーボの移動速度制限。0=最高速（危険）。小さいほどゆっくり。安全のため低めで起動。
+int servoSpeed = 200;
+//-------------------------------------------------
+
+void scs_moveToPos(byte id, int position);
+void servo_write(int ch, float ang);
+void fRIK(float x, float z);
+void fLIK(float x, float z);
+void rRIK(float x, float z);
+void rLIK(float x, float z);
+
+
+//加速度センサから傾きデータ取得 [deg]
+void get_theta() {
+  M5.Imu.getAccel(&accX, &accY, &accZ);
+  //傾斜角導出 単位はdeg
+  // TODO: ATOM Matrix と ATOMS3 では MPU6886 の実装向きが異なる可能性が高い。
+  // 実機テスト（シリアルの acc デバッグ出力）で符号・軸を確認してから IMU/Jump を使うこと。
+  theta_X =  atan(accY / -accZ) * 57.29578f;
+  theta_Y =  atan(-accX / -accZ) * 57.29578f;  // 実機計測：ロール軸が原作と逆のため符号反転（2026-06-11）
+
+  // 表裏判定。ATOMS3/MPU6886 はZ軸の向きが原作(ATOM Matrix)と逆で、
+  // 画面上向き=立ち姿勢で accZ≈+1g、裏返しで accZ≈-1g となる。
+  // このため原作の accZ 比較を反転させている（2026-06-13 実機確認）。
+  if(Mode != Jump2){
+    if(pos == 1 && accZ > 0.96) pos = 0;   // 画面上向き=立ち姿勢
+    if(pos == 0 && accZ < -0.96) pos = 1;  // 裏返し
   }
-  prefs.end();
 }
-void saveStorage() {
-  prefs.begin("robot", false);
-  for (int i=0; i<8; i++) {
-    char key[4]; snprintf(key,sizeof(key),"s%d",i);
-    prefs.putUShort(key, storagePos[i]);
+
+//Y軸 角速度取得
+void get_gyro_data() {
+  M5.Imu.getGyro(&gyroX, &gyroY, &gyroZ);
+  theta_Xdot = -gyroX;
+  theta_Ydot = -gyroY;  // theta_Y の符号反転と整合させるため反転（2026-06-11）
+}
+
+
+//browser
+// 動作系はすべてPOSTフォームで送信する（GETリンクだとSafari等のリンク先読みで
+// 勝手に動作が発火し暴れるため）。各エンドポイントもPOST専用で登録する。
+static String formBtn(const char* action, const String& label, const String& cls){
+  return "<form method='post' action='" + String(action) + "' style='display:inline;margin:0'>"
+         "<button class='" + cls + "'>" + label + "</button></form>";
+}
+static String pmBtn(const char* action, const String& label){
+  return "<form method='post' action='" + String(action) + "' style='display:inline;margin:0'>"
+         "<button class='pm'>" + label + "</button></form>";
+}
+
+void handleRoot() {
+  String temp ="<!DOCTYPE html>\n<html lang=\"ja\"><head>";
+  temp +="<meta charset=\"utf-8\">";
+  temp +="<title>robot0009</title>";
+  temp +="<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+  temp +="<style>";
+  temp +=".container{margin:auto;text-align:center;font-size:1.2rem;}";
+  temp +="span{display:inline-block;border:1px solid #ccc;width:110px;height:32px;line-height:32px;vertical-align:middle;margin:2px;}";
+  temp +=".pm{width:54px;height:36px;font-weight:bold;margin:2px;vertical-align:middle;}";
+  temp +="button{width:100px;height:42px;font-weight:bold;margin:4px;}";
+  temp +="button.on{background:lime;color:white;}";
+  temp +=".column-3{max-width:330px;margin:auto;display:flex;justify-content:center;flex-wrap:wrap;}";
+  temp +="</style></head><body><div class=\"container\">";
+  temp +="<h3>robot0009</h3>";
+
+  // ===== 安全構成：速度 → CALIB/STAND → 立ち姿勢調整 → 個別サーボ =====
+  // 歩行ボタン（Step/Advance/Jump/Roll 等）は速度を詰めるまで一旦隠す。
+  // エンドポイント自体は残してあるので、安定後にここへ formBtn を戻すだけで復活。
+
+  // 速度（小さいほどゆっくり＝安全。0=最高速で危険）
+  temp +="<b>speed</b>（小さいほど安全）<br>";
+  temp += pmBtn("/speedM","-") + "<span>"+String(servoSpeed)+"</span>" + pmBtn("/speedP","+") + "<br>";
+
+  // 残留データを初期値へ（offsetは保持）
+  temp += formBtn("/resetParams","RESET","off");
+
+  temp +="<hr>";
+
+  // モード切替：CALIB（全サーボ水平保持）/ STAND（IK立ち姿勢）
+  temp +="<div class=\"column-3\">";
+  temp += formBtn("/calMode",   "CALIB", (Mode==Calib)?"on":"off");
+  temp += formBtn("/standMode", "STAND", (Mode==0)    ?"on":"off");
+  temp +="</div>";
+
+  // 立ち姿勢の調整（STAND時の脚の前後位置・高さ）
+  temp +="x (mm)<br>"      + pmBtn("/xM","-")      + "<span>"+String(x)+"</span>"      + pmBtn("/xP","+")      + "<br>";
+  temp +="height (mm)<br>" + pmBtn("/heightM","-") + "<span>"+String(height)+"</span>" + pmBtn("/heightP","+") + "<br>";
+
+  temp +="<hr>";
+
+  // ===== 歩行（低速で1つずつ検証）=====
+  temp +="<div class=\"column-3\">";
+  temp += formBtn("/step",    "Step",    modeBtStep);
+  temp += formBtn("/stretch", "Stretch", modeBtStretch);
+  temp += formBtn("/ad",      "Advance", modeBtAd);
+  temp += formBtn("/back",    "Back",    modeBtBack);
+  temp += formBtn("/L",       "L",       modeBtL);
+  temp += formBtn("/R",       "R",       modeBtR);
+  temp += formBtn("/imu",     "IMU",     modeBtImu);
+  temp += formBtn("/Jump",    "Jump",    modeBtJump);
+  temp += formBtn("/Roll",    "Roll",    modeBtRoll);
+  temp +="</div>";
+
+  // 歩行パラメータ
+  temp +="period (msec)<br>" + pmBtn("/periodM","-") + "<span>"+String(period)+"</span>" + pmBtn("/periodP","+") + "<br>";
+  temp +="upHeight (mm)<br>" + pmBtn("/upHeightM","-")+"<span>"+String(upHeight)+"</span>"+pmBtn("/upHeightP","+")+ "<br>";
+  temp +="stride (mm)<br>"   + pmBtn("/strideM","-") + "<span>"+String(stride)+"</span>" + pmBtn("/strideP","+") + "<br>";
+
+  temp +="<hr>";
+
+  temp +="<h4>" + String(servoLabel(calSel)) + "</h4>";
+
+  temp +="servo select<br>" + pmBtn("/calPrev","&#9664;") + "<span>ID "+String(calSel)+"</span>" + pmBtn("/calNext","&#9654;") + "<br>";
+
+  temp +="offset (raw)<br>" + pmBtn("/calM10","-10") + pmBtn("/calM1","-1")
+        + "<span>"+String(offset[calSel])+"</span>"
+        + pmBtn("/calP1","+1") + pmBtn("/calP10","+10") + "<br>";
+
+  temp +="raw pos<br><span>" + String(511 + offset[calSel]) + "</span><br>";
+
+  temp += formBtn("/calReset","reset","off");
+
+  temp +="</div></body></html>";
+  server.send(200, "text/html", temp);
+}
+
+void handleL() {
+  if(modeBtL == "off"){
+    modeBtL = "on";
+    modeBtR = "off";
+    modeBtJump = "off";
+    modeBtStep = "off";
+    modeBtStretch = "off";
+    modeBtAd = "off";
+    modeBtBack = "off";
+    modeBtImu = "off";
+    modeBtRoll = "off";
+
+    Mode = L;
+  }else{
+    modeBtL = "off";
+
+    Mode = 0;
   }
-  prefs.end();
+  handleRoot();
 }
 
-// ── 送信（物理限界クランプ付き）──────────────────────────────
-void sendPos(uint8_t id, int pos, int ms) {
-  if (id < 8) {
-    pos = constrain(pos, POS_MIN[id], POS_MAX[id]); // 物理限界
+void handleR() {
+  if(modeBtR == "off"){
+    modeBtL = "off";
+    modeBtR = "on";
+    modeBtJump = "off";
+    modeBtStep = "off";
+    modeBtStretch = "off";
+    modeBtAd = "off";
+    modeBtBack = "off";
+    modeBtImu = "off";
+    modeBtRoll = "off";
+
+    Mode = R;
+  }else{
+    modeBtR = "off";
+
+    Mode = 0;
   }
-  pos = constrain(pos, 0, 1023); // 電気的限界（念のため）
-  byte msg[13];
-  msg[0]=0xFF; msg[1]=0xFF;
-  msg[2]=id;   msg[3]=9;
-  msg[4]=3;    msg[5]=42;
-  msg[6]=(pos>>8)&0xFF; msg[7]=pos&0xFF;
-  msg[8]=(ms>>8)&0xFF;  msg[9]=ms&0xFF;
-  msg[10]=0; msg[11]=0;
-  byte sum=0; for(int i=2;i<12;i++) sum+=msg[i]; msg[12]=~sum;
-  Serial1.write(msg,13); Serial1.flush(); txCount++;
+  handleRoot();
 }
 
-void sendTorque(uint8_t id, bool enable) {
-  byte msg[8];
-  msg[0]=0xFF; msg[1]=0xFF;
-  msg[2]=id;   msg[3]=4;
-  msg[4]=3;    msg[5]=40;
-  msg[6]= enable ? 1 : 0;
-  byte sum=0; for(int i=2;i<7;i++) sum+=msg[i]; msg[7]=~sum;
-  Serial1.write(msg,8); Serial1.flush();
-}
+void handleJump() {
+  if(modeBtJump == "off" && pos == 0){
+    modeBtL = "off";
+    modeBtR = "off";
+    modeBtJump = "on";
+    modeBtStep = "off";
+    modeBtStretch = "off";
+    modeBtAd = "off";
+    modeBtBack = "off";
+    modeBtImu = "off";
+    modeBtRoll = "off";
 
-void sendGrp(const uint8_t* ids, int n, int pos, int ms) {
-  for (int i=0; i<n; i++) sendPos(ids[i], pos, ms);
-}
+    Mode = Jump;
+  }else{
+    modeBtJump = "off";
 
-// ── スタンバイから相対値で送る ───────────────────────────────
-void sendRelPos(uint8_t id, int offset, int ms) {
-  sendPos(id, (int)standbyPos[id] + offset, ms);
-}
-void sendRelGrp(const uint8_t* ids, int n, int offset, int ms) {
-  for (int i=0; i<n; i++) sendRelPos(ids[i], offset, ms);
-}
-
-// ── 膝の「内側」「外側」方向（サーボ取付向きが左右で逆）────
-// 内側（足を持ち上げる方向）
-//   ID2(左後膝), ID6(右前膝) → +増やすと内側
-//   ID3(右後膝), ID7(左前膝) → -減らすと内側
-void kneeIn(uint8_t id, int amount, int ms) {
-  if (id == 2 || id == 6) sendRelPos(id, -amount, ms);
-  else                     sendRelPos(id, -amount, ms);
-}
-void kneeOut(uint8_t id, int amount, int ms) {
-  if (id == 2 || id == 6) sendRelPos(id, +amount, ms);
-  else                     sendRelPos(id, +amount, ms);
-}
-void kneeStandby(uint8_t id, int ms) { sendRelPos(id, 0, ms); }
-
-// GA膝(ID6,ID2) / GB膝(ID7,ID3) まとめて操作
-void kneeInGA(int v, int ms)  { kneeIn(6,v,ms);  kneeIn(2,v,ms);  }
-void kneeInGB(int v, int ms)  { kneeIn(7,v,ms);  kneeIn(3,v,ms);  }
-void kneeOutGA(int v, int ms) { kneeOut(6,v,ms); kneeOut(2,v,ms); }
-void kneeOutGB(int v, int ms) { kneeOut(7,v,ms); kneeOut(3,v,ms); }
-void kneeStdGA(int ms) { kneeStandby(6,ms); kneeStandby(2,ms); }
-void kneeStdGB(int ms) { kneeStandby(7,ms); kneeStandby(3,ms); }
-
-// 左側膝(ID7,ID2) / 右側膝(ID6,ID3)
-void kneeInGL(int v, int ms)  { kneeIn(7,v,ms);  kneeIn(2,v,ms);  }
-void kneeInGR(int v, int ms)  { kneeIn(6,v,ms);  kneeIn(3,v,ms);  }
-void kneeStdGL(int ms) { kneeStandby(7,ms); kneeStandby(2,ms); }
-void kneeStdGR(int ms) { kneeStandby(6,ms); kneeStandby(3,ms); }
-
-void goStandby() { for(int i=0;i<8;i++) sendPos(i, standbyPos[i], 600); }
-void goStorage()  { for(int i=0;i<8;i++) sendPos(i, storagePos[i], 600); }
-
-// ── 待機（モード変更で即抜ける）──────────────────────────────
-static bool waitM(uint8_t m, int ms) {
-  unsigned long end = millis() + ms;
-  while ((long)(millis() - end) < 0) {
-    if (mode != m) return false;
-    delay(10);
+    Mode = 0;
   }
-  return true;
+  handleRoot();
 }
 
-void pushState() {
-  char buf[48];
-  snprintf(buf,sizeof(buf),"{\"mode\":%d,\"tx\":%lu}",mode,txCount);
-  ws.textAll(buf);
-}
+void handleStep() {
+  if(modeBtStep == "off"){
+    modeBtL = "off";
+    modeBtR = "off";
+    modeBtJump = "off";
+    modeBtStep = "on";
+    modeBtStretch = "off";
+    modeBtAd = "off";
+    modeBtBack = "off";
+    modeBtImu = "off";
+    modeBtRoll = "off";
 
-// ── WebSocket ─────────────────────────────────────────────────
-void onWsEvent(AsyncWebSocket* w, AsyncWebSocketClient* cl,
-               AwsEventType type, void* arg, uint8_t* data, size_t len) {
-  w->cleanupClients();
-  if (type == WS_EVT_CONNECT) {
-    char buf[48];
-    snprintf(buf,sizeof(buf),"{\"mode\":%d,\"tx\":%lu}",mode,txCount);
-    cl->text(buf); return;
+    Mode = Step;
+  }else{
+    modeBtStep = "off";
+
+    Mode = 0;
   }
-  if (type != WS_EVT_DATA) return;
-  AwsFrameInfo* info = (AwsFrameInfo*)arg;
-  if (!info->final||info->index!=0||info->len!=len||info->opcode!=WS_TEXT) return;
+  handleRoot();
+}
 
-  char buf[20];
-  size_t n = min(len,(size_t)19);
-  memcpy(buf,data,n); buf[n]='\0';
 
-  int cfgId, cfgVal;
+void handleImu() {
+  if(modeBtImu == "off"){
+    modeBtL = "off";
+    modeBtR = "off";
+    modeBtJump = "off";
+    modeBtStep = "off";
+    modeBtStretch = "off";
+    modeBtAd = "off";
+    modeBtBack = "off";
+    modeBtImu = "on";
+    modeBtRoll = "off";
 
-  if (sscanf(buf,"cfg:%d:%d",&cfgId,&cfgVal)==2) {
-    if (cfgId>=0&&cfgId<=7&&cfgVal>=0&&cfgVal<=1023) {
-      standbyPos[cfgId]=(uint16_t)cfgVal;
-      sendTorque(cfgId,true); sendPos(cfgId,cfgVal,300);
+    // 積分項リセット（前回の残留値で脚が跳ねるのを防止）
+    hXpre = 0; hYpre = 0; hX = 0; hY = 0;
+
+    Mode = Imu;
+  }else{
+    modeBtImu = "off";
+
+    hXpre = 0; hYpre = 0; hX = 0; hY = 0;
+
+    Mode = 0;
+  }
+  handleRoot();
+}
+
+void handleStretch() {
+  if(modeBtStretch == "off"){
+    modeBtL = "off";
+    modeBtR = "off";
+    modeBtJump = "off";
+    modeBtStep = "off";
+    modeBtStretch = "on";
+    modeBtAd = "off";
+    modeBtBack = "off";
+    modeBtImu = "off";
+    modeBtRoll = "off";
+
+    Mode = Stretch;
+  }else{
+    modeBtStretch = "off";
+
+    Mode = 0;
+  }
+  handleRoot();
+}
+
+void handleAd() {
+  if(modeBtAd == "off"){
+    modeBtL = "off";
+    modeBtR = "off";
+    modeBtJump = "off";
+    modeBtStep = "off";
+    modeBtStretch = "off";
+    modeBtAd = "on";
+    modeBtBack = "off";
+    modeBtImu = "off";
+    modeBtRoll = "off";
+
+    Mode = Advance;
+  }else{
+    modeBtAd = "off";
+
+    Mode = 0;
+  }
+  handleRoot();
+}
+
+void handleBack() {
+  if(modeBtBack == "off"){
+    modeBtL = "off";
+    modeBtR = "off";
+    modeBtJump = "off";
+    modeBtStep = "off";
+    modeBtStretch = "off";
+    modeBtAd = "off";
+    modeBtBack = "on";
+    modeBtImu = "off";
+    modeBtRoll = "off";
+
+    Mode = Back;
+  }else{
+    modeBtBack = "off";
+
+    Mode = 0;
+  }
+  handleRoot();
+}
+
+void handleRoll() {
+  if(modeBtRoll == "off"){
+    modeBtL = "off";
+    modeBtR = "off";
+    modeBtJump = "off";
+    modeBtStep = "off";
+    modeBtStretch = "off";
+    modeBtAd = "off";
+    modeBtBack = "off";
+    modeBtImu = "off";
+    modeBtRoll = "on";
+
+    Mode = Roll;
+  }else{
+    modeBtRoll = "off";
+
+    Mode = 0;
+  }
+  handleRoot();
+}
+
+
+// ===== キャリブレーション操作 =====
+void saveOffset(int id){
+  char key[6];
+  snprintf(key, sizeof(key), "off%d", id);
+  preferences.putInt(key, offset[id]);
+}
+
+void handleCalNext() { calSel = (calSel + 1) % 8; handleRoot(); }
+void handleCalPrev() { calSel = (calSel + 7) % 8; handleRoot(); }
+
+void handleCalP10() { offset[calSel] = constrain(offset[calSel] + 10, -300, 300); saveOffset(calSel); handleRoot(); }
+void handleCalP1()  { offset[calSel] = constrain(offset[calSel] + 1,  -300, 300); saveOffset(calSel); handleRoot(); }
+void handleCalM1()  { offset[calSel] = constrain(offset[calSel] - 1,  -300, 300); saveOffset(calSel); handleRoot(); }
+void handleCalM10() { offset[calSel] = constrain(offset[calSel] - 10, -300, 300); saveOffset(calSel); handleRoot(); }
+void handleCalReset() { offset[calSel] = 0; saveOffset(calSel); handleRoot(); }
+
+void handleCalibMode() { Mode = Calib; handleRoot(); }  // 全サーボ水平保持
+void handleStandMode() { Mode = 0;     handleRoot(); }  // IKによる立ち姿勢
+
+void handleSpeedM() {  // 遅く（より安全）
+  if(servoSpeed > 20){ servoSpeed -= 20; preferences.putInt("servoSpeed", servoSpeed); }
+  handleRoot();
+}
+void handleSpeedP() {  // 速く
+  if(servoSpeed < 1000){ servoSpeed += 20; preferences.putInt("servoSpeed", servoSpeed); }
+  handleRoot();
+}
+
+// 制御パラメータを初期値へ戻す（offset=キャリブ値は消さない）
+void handleResetParams() {
+  period = 80; x = 60; height = 40; upHeight = 10; stride = 12;
+  servoSpeed = 200; Kp = 0.3; Kd = 0.3; wakeUpAngle = -1.0;
+  preferences.putInt("period", period);
+  preferences.putInt("x", x);
+  preferences.putInt("height", height);
+  preferences.putInt("upHeight", upHeight);
+  preferences.putInt("stride", stride);
+  preferences.putInt("servoSpeed", servoSpeed);
+  preferences.putFloat("Kp", Kp);
+  preferences.putFloat("Kd", Kd);
+  preferences.putFloat("wakeUpAngle", wakeUpAngle);
+  handleRoot();
+}
+
+void handleWakeUpAngleM() {
+  if(wakeUpAngle > -90.0){
+    wakeUpAngle -= 0.5;
+    preferences.putFloat("wakeUpAngle", wakeUpAngle);
+  }
+  handleRoot();
+}
+void handleWakeUpAngleP() {
+  if(wakeUpAngle <= 90.0){
+    wakeUpAngle += 0.5;
+    preferences.putFloat("wakeUpAngle", wakeUpAngle);
+  }
+  handleRoot();
+}
+
+
+
+void handleKpM() {
+  if(Kp > 0){
+    Kp -= 0.1;
+    preferences.putFloat("Kp", Kp);
+  }
+  handleRoot();
+}
+void handleKpP() {
+  if(Kp <= 10){
+    Kp += 0.1;
+    preferences.putFloat("Kp", Kp);
+  }
+  handleRoot();
+}
+
+void handleKdM() {
+  if(Kd > 0){
+    Kd -= 0.1;
+    preferences.putFloat("Kd", Kd);
+  }
+  handleRoot();
+}
+void handleKdP() {
+  if(Kd <= 10){
+    Kd += 0.1;
+    preferences.putFloat("Kd", Kd);
+  }
+  handleRoot();
+}
+
+
+
+
+void handlePeriodM() {
+  if(period > 40){   // 40未満は歩行ループが高速回転して危険なので下限
+    period -= 5;
+    preferences.putInt("period", period);
+  }
+  handleRoot();
+}
+void handlePeriodP() {
+  if(period <= 3000){
+    period += 5;
+    preferences.putInt("period", period);
+  }
+  handleRoot();
+}
+
+
+void handlexM() {
+  if(x > -615){
+    x -= 5;
+    preferences.putInt("x", x);
+  }
+  handleRoot();
+}
+void handlexP() {
+  if(x < 515){
+    x += 5;
+    preferences.putInt("x", x);
+  }
+  handleRoot();
+}
+
+
+void handleHeightM() {
+  if(height > -120){
+    height -= 5;
+    preferences.putInt("height", height);
+  }
+  handleRoot();
+}
+void handleHeightP() {
+  if(height <= 120){
+    height += 5;
+    preferences.putInt("height", height);
+  }
+  handleRoot();
+}
+
+void handleUpHeightM() {
+  if(upHeight > 0){
+    upHeight -= 2;
+    preferences.putInt("upHeight", upHeight);
+  }
+  handleRoot();
+}
+void handleUpHeightP() {
+  if(upHeight <= 500){
+    upHeight += 2;
+    preferences.putInt("upHeight", upHeight);
+  }
+  handleRoot();
+}
+
+void handleStrideM() {
+  if(stride > 0){
+    stride -= 2;
+    preferences.putInt("stride", stride);
+  }
+  handleRoot();
+}
+void handleStrideP() {
+  if(stride <= 40){
+    stride += 2;
+    preferences.putInt("stride", stride);
+  }
+  handleRoot();
+}
+
+
+const char* modeName() {
+  switch(Mode){
+    case L:       return "L";
+    case R:       return "R";
+    case Imu:     return "IMU";
+    case Jump:    return "Jump";
+    case Jump2:   return "Jump2";
+    case Step:    return "Step";
+    case Stretch: return "Stretch";
+    case Advance: return "Advance";
+    case Back:    return "Back";
+    case Roll:    return "Roll";
+    case Calib:   return "CALIB";
+    default:      return "Stand";
+  }
+}
+
+// 原作の5x5 LEDマトリクス表示の置き換え：128x128 LCDへ
+// 上段：モード名 / 中段：kalAngleX,Y / 下段：水準器風バブル
+void updateDisplay() {
+  M5.Display.startWrite();
+
+  M5.Display.setTextSize(2);
+  M5.Display.fillRect(0, 0, 128, 18, TFT_BLACK);
+  M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+  M5.Display.setCursor(2, 1);
+  M5.Display.print(modeName());
+
+  M5.Display.fillRect(0, 20, 128, 36, TFT_BLACK);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.setCursor(2, 21);
+  M5.Display.printf("X:%6.1f", kalAngleX);
+  M5.Display.setCursor(2, 39);
+  M5.Display.printf("Y:%6.1f", kalAngleY);
+
+  M5.Display.fillRect(0, 60, 128, 64, TFT_BLACK);
+  if(Mode == Calib){
+    // キャリブレーション：選択ID・offset・raw を表示
+    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Display.setCursor(2, 62);
+    M5.Display.printf("ID:%d", calSel);
+    M5.Display.setCursor(2, 80);
+    M5.Display.printf("off:%4d", offset[calSel]);
+    M5.Display.setCursor(2, 98);
+    M5.Display.printf("raw:%4d", 511 + offset[calSel]);
+  }else{
+    M5.Display.drawRect(32, 60, 64, 64, TFT_DARKGREY);
+    M5.Display.drawFastHLine(32, 92, 64, TFT_DARKGREY);
+    M5.Display.drawFastVLine(64, 60, 64, TFT_DARKGREY);
+    int bx = 64 + (int)constrain(kalAngleY, -28.0f, 28.0f);
+    int by = 92 + (int)constrain(kalAngleX, -28.0f, 28.0f);
+    uint16_t c = (fabsf(kalAngleX) <= 1.0f && fabsf(kalAngleY) <= 1.0f) ? TFT_GREEN : TFT_CYAN;
+    M5.Display.fillCircle(bx, by, 3, c);
+  }
+
+  M5.Display.endWrite();
+}
+
+
+//Core0
+void browser(void *pvParameters) {
+  M5.Display.setBrightness(60);
+  M5.Display.fillScreen(TFT_BLACK);
+
+  disableCore0WDT();
+
+  for (;;){
+    server.handleClient();
+
+    updateDisplay();
+
+    // IMU軸キャリブレーション用デバッグ出力（§7：符号・軸の実機確認に使う）
+    static unsigned long lastDbg = 0;
+    if(millis() - lastDbg >= 500){
+      lastDbg = millis();
+      Serial.printf("acc: %6.3f %6.3f %6.3f  theta: %6.1f %6.1f  kal: %6.1f %6.1f  pos:%d\n",
+                    accX, accY, accZ, theta_X, theta_Y, kalAngleX, kalAngleY, pos);
     }
-    return;
-  }
-  if (sscanf(buf,"scfg:%d:%d",&cfgId,&cfgVal)==2) {
-    if (cfgId>=0&&cfgId<=7&&cfgVal>=0&&cfgVal<=1023) {
-      storagePos[cfgId]=(uint16_t)cfgVal;
-      sendTorque(cfgId,true); sendPos(cfgId,cfgVal,300);
-    }
-    return;
-  }
 
-  if (!strcmp(buf,"save"))    { saveStandby(); ws.textAll("{\"saved\":true}"); return; }
-  if (!strcmp(buf,"ssave"))   { saveStorage(); ws.textAll("{\"saved\":true}"); return; }
-
-  if (!strcmp(buf,"getcfg")) {
-    char resp[80];
-    snprintf(resp,sizeof(resp),"{\"cfg\":[%d,%d,%d,%d,%d,%d,%d,%d]}",
-      standbyPos[0],standbyPos[1],standbyPos[2],standbyPos[3],
-      standbyPos[4],standbyPos[5],standbyPos[6],standbyPos[7]);
-    cl->text(resp); return;
+    delay(50);
   }
-  if (!strcmp(buf,"getscfg")) {
-    char resp[80];
-    snprintf(resp,sizeof(resp),"{\"scfg\":[%d,%d,%d,%d,%d,%d,%d,%d]}",
-      storagePos[0],storagePos[1],storagePos[2],storagePos[3],
-      storagePos[4],storagePos[5],storagePos[6],storagePos[7]);
-    cl->text(resp); return;
-  }
-
-  if (!strcmp(buf,"stopall")) { mode=M_IDLE; pushState(); return; }
-
-  if (!strcmp(buf,"center")) {
-    if (mode==M_FOLD) { sendTorque(0xFE,true); delay(100); }
-    mode=M_IDLE; goStandby(); pushState(); return;
-  }
-
-  if (!strcmp(buf,"fold")) {
-    if (mode==M_FOLD) {
-      sendTorque(0xFE,true); delay(100);
-      mode=M_IDLE; goStandby();
-    } else {
-      mode=M_FOLD;
-      goStorage();
-      delay(800);
-      sendTorque(0xFE,false);
-    }
-    pushState(); return;
-  }
-
-  if (mode==M_FOLD) { sendTorque(0xFE,true); delay(100); }
-  uint8_t req=M_IDLE;
-  if      (!strcmp(buf,"sweep"))   req=M_SWEEP;
-  else if (!strcmp(buf,"step"))    req=M_STEP;
-  else if (!strcmp(buf,"fwd"))     req=M_FWD;
-  else if (!strcmp(buf,"back"))    req=M_BACK;
-  else if (!strcmp(buf,"left"))    req=M_LEFT;
-  else if (!strcmp(buf,"right"))   req=M_RIGHT;
-  else if (!strcmp(buf,"stretch")) req=M_STRETCH;
-  mode=(mode==req) ? M_IDLE : req;
-  pushState();
 }
 
-static const char* modeStr[]={"Standby","Sweep","Step","Fwd","Back","Left","Right","Stretch","FOLD"};
-void drawDisp() {
-  M5.Display.fillScreen(0x0000);
-  M5.Display.setTextColor(0xFFFF,0x0000);
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(0,0);
-  M5.Display.println("robot0009");
-  M5.Display.println(modeStr[mode]);
-  M5.Display.print("IP:"); M5.Display.println(WiFi.softAPIP());
-  M5.Display.print("TX:"); M5.Display.println(txCount);
-}
 
 void setup() {
-  auto cfg = M5.config(); cfg.serial_baudrate=115200;
-  M5.begin(cfg); Serial.setTxTimeoutMs(0);
-  delay(1000);
-  M5.Display.setRotation(0);
-  M5.Display.fillScreen(0); M5.Display.setTextColor(0xFFFF,0);
-  M5.Display.setCursor(0,0); M5.Display.println("Booting...");
+  auto cfg = M5.config();
+  M5.begin(cfg);
 
-  loadPrefs();
+  Serial1.begin(1000000, SERIAL_8N1, -1, TX_PIN);
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(ip,ip,subnet);
-  WiFi.softAP(ssid,pass);
-  delay(200);
-
-  pinMode(TX_PIN,OUTPUT); digitalWrite(TX_PIN,HIGH); delay(10);
-  Serial1.begin(1000000,SERIAL_8N1,-1,TX_PIN); delay(100);
-
-  ws.onEvent(onWsEvent);
-  server.addHandler(&ws);
-
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
-    String h;
-    h += "<!DOCTYPE html><html><head>";
-    h += "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-    h += "<title>robot0009</title><style>";
-    h += "body{font-family:-apple-system,sans-serif;margin:0;padding:14px;background:#f0f0f0;display:flex;justify-content:center;}";
-    h += ".c{width:300px;}h2,h3{text-align:center;margin:0 0 12px;}";
-    h += ".row{display:flex;gap:8px;margin-bottom:8px;}";
-    h += ".btn{flex:1;height:64px;font-size:1.25rem;font-weight:bold;border:none;border-radius:12px;color:#fff;cursor:pointer;transition:filter .1s;}";
-    h += ".btn:active{filter:brightness(.8);}";
-    h += ".sw{background:#22c55e;}.sw.on{background:#ef4444;}";
-    h += ".st{background:#f59e0b;}.st.on{background:#b45309;}";
-    h += ".fw{background:#3b82f6;}.fw.on{background:#1d4ed8;}";
-    h += ".bk{background:#6366f1;}.bk.on{background:#3730a3;}";
-    h += ".lr{background:#14b8a6;}.lr.on{background:#0f766e;}";
-    h += ".sx{background:#a855f7;}.sx.on{background:#7e22ce;}";
-    h += ".sb{background:#6b7280;}.sb.on{background:#374151;}";
-    h += ".fo{background:#f97316;}.fo.on{background:#7c2d12;}";
-    h += ".co{background:#475569;height:52px;font-size:1.1rem;}";
-    h += "#st{text-align:center;margin-top:10px;font-size:.9rem;color:#555;}";
-    h += ".tabs{display:flex;gap:6px;margin-bottom:12px;}";
-    h += ".tabBtn{flex:1;height:44px;font-size:1rem;font-weight:bold;border:none;border-radius:10px;background:#cbd5e1;cursor:pointer;}";
-    h += ".tabBtn.active{background:#3b82f6;color:#fff;}";
-    h += ".srow{display:flex;align-items:center;gap:4px;margin-bottom:8px;}";
-    h += ".sid{width:38px;font-weight:bold;font-size:.9rem;flex-shrink:0;}";
-    h += ".val{width:46px;text-align:center;font-size:1rem;font-weight:bold;background:#fff;border-radius:6px;padding:5px 0;flex-shrink:0;}";
-    h += ".ab{flex:1;height:42px;font-size:1rem;font-weight:bold;border:none;border-radius:8px;background:#e2e8f0;cursor:pointer;}";
-    h += ".ab:active{background:#cbd5e1;}";
-    h += ".savebtn{width:100%;height:54px;font-size:1.15rem;font-weight:bold;border:none;border-radius:12px;background:#22c55e;color:#fff;cursor:pointer;margin-bottom:8px;}";
-    h += ".backbtn{width:100%;height:48px;font-size:1.1rem;font-weight:bold;border:none;border-radius:12px;background:#6b7280;color:#fff;cursor:pointer;}";
-    h += "#saveMsg{display:block;text-align:center;color:#16a34a;font-weight:bold;min-height:1.4em;margin-bottom:6px;}";
-    h += "</style></head><body><div class='c'>";
-    h += "<div id='main'><h2>robot0009</h2>";
-    h += "<div class='row'><button id='b1' class='btn sw' onclick='tap(1,\"sweep\")'>START</button></div>";
-    h += "<div class='row'><button id='b2' class='btn st' onclick='tap(2,\"step\")'>STEP</button><button id='b7' class='btn sx' onclick='tap(7,\"stretch\")'>STRETCH</button></div>";
-    h += "<div class='row'><button id='b3' class='btn fw' onclick='tap(3,\"fwd\")'>FWD</button></div>";
-    h += "<div class='row'><button id='b5' class='btn lr' onclick='tap(5,\"left\")'>LEFT</button><button id='b6' class='btn lr' onclick='tap(6,\"right\")'>RIGHT</button></div>";
-    h += "<div class='row'><button id='b4' class='btn bk' onclick='tap(4,\"back\")'>BACK</button></div>";
-    h += "<div class='row'><button id='b0' class='btn sb' onclick='tap(0,\"center\")'>STANDBY</button><button id='b8' class='btn fo' onclick='ws.send(\"fold\")'>FOLD</button></div>";
-    h += "<div class='row'><button class='btn co' onclick='openCfg()'>CONFIG</button></div>";
-    h += "<div id='st'>Standby | TX: 0</div></div>";
-    h += "<div id='cfg' style='display:none'><h3>姿勢設定</h3>";
-    h += "<div class='tabs'>";
-    h +=   "<button id='tab0' class='tabBtn active' onclick='showTab(0)'>STANDBY</button>";
-    h +=   "<button id='tab1' class='tabBtn'        onclick='showTab(1)'>収納</button>";
-    h += "</div>";
-    h += "<div id='panel0'><div id='rows0'></div></div>";
-    h += "<div id='panel1' style='display:none'><div id='rows1'></div></div>";
-    h += "<span id='saveMsg'></span>";
-    h += "<button class='savebtn' onclick='saveActive()'>NVSに保存</button>";
-    h += "<button class='backbtn' onclick='closeCfg()'>戻る</button>";
-    h += "</div>";
-    h += "<script>";
-    h += "var ws,cur=0,activeTab=0;";
-    h += "var vals=[511,511,511,511,511,511,511,511];";
-    h += "var svals=[511,511,511,511,511,511,511,511];";
-    h += "var BID =[null,'b1','b2','b3','b4','b5','b6','b7'];";
-    h += "var BCLS=[null,'sw','st','fw','bk','lr','lr','sx'];";
-    h += "var BLB =[null,'START','STEP','FWD','BACK','LEFT','RIGHT','STRETCH'];";
-    h += "function makeRows(pfx,arr,fn,el){";
-    h +=   "var s='';";
-    h +=   "for(var i=0;i<8;i++){";
-    h +=     "s+=\"<div class='srow'><span class='sid'>ID \"+i+\"</span>\";";
-    h +=     "s+=\"<button class='ab' onclick='\"+fn+\"(\"+i+\",-20)'>-20</button>\";";
-    h +=     "s+=\"<button class='ab' onclick='\"+fn+\"(\"+i+\",-5)'>-5</button>\";";
-    h +=     "s+=\"<span class='val' id='\"+pfx+i+\"'>\"+arr[i]+\"</span>\";";
-    h +=     "s+=\"<button class='ab' onclick='\"+fn+\"(\"+i+\",5)'>+5</button>\";";
-    h +=     "s+=\"<button class='ab' onclick='\"+fn+\"(\"+i+\",20)'>+20</button></div>\";";
-    h +=   "}";
-    h +=   "document.getElementById(el).innerHTML=s;";
-    h += "}";
-    h += "function buildCfg(){makeRows('sv',vals,'adj','rows0');makeRows('ss',svals,'adjs','rows1');}";
-    h += "function adj(id,d){";
-    h +=   "vals[id]=Math.max(0,Math.min(1023,vals[id]+d));";
-    h +=   "document.getElementById('sv'+id).textContent=vals[id];";
-    h +=   "if(ws&&ws.readyState===1)ws.send('cfg:'+id+':'+vals[id]);";
-    h += "}";
-    h += "function adjs(id,d){";
-    h +=   "svals[id]=Math.max(0,Math.min(1023,svals[id]+d));";
-    h +=   "document.getElementById('ss'+id).textContent=svals[id];";
-    h +=   "if(ws&&ws.readyState===1)ws.send('scfg:'+id+':'+svals[id]);";
-    h += "}";
-    h += "function showTab(t){";
-    h +=   "activeTab=t;";
-    h +=   "document.getElementById('panel0').style.display=t===0?'block':'none';";
-    h +=   "document.getElementById('panel1').style.display=t===1?'block':'none';";
-    h +=   "document.getElementById('tab0').className='tabBtn'+(t===0?' active':'');";
-    h +=   "document.getElementById('tab1').className='tabBtn'+(t===1?' active':'');";
-    h += "}";
-    h += "function saveActive(){if(ws&&ws.readyState===1)ws.send(activeTab===0?'save':'ssave');}";
-    h += "function openCfg(){";
-    h +=   "if(ws&&ws.readyState===1){ws.send('stopall');ws.send('getcfg');ws.send('getscfg');}";
-    h +=   "showTab(0);";
-    h +=   "document.getElementById('main').style.display='none';";
-    h +=   "document.getElementById('cfg').style.display='block';";
-    h += "}";
-    h += "function closeCfg(){";
-    h +=   "document.getElementById('cfg').style.display='none';";
-    h +=   "document.getElementById('main').style.display='block';";
-    h += "}";
-    h += "function upd(m,tx){";
-    h +=   "if(cur>0&&cur<=7)document.getElementById(BID[cur]).className='btn '+BCLS[cur];";
-    h +=   "document.getElementById('b0').className='btn sb';";
-    h +=   "document.getElementById('b8').className='btn fo'+(m===8?' on':'');";
-    h +=   "cur=m;";
-    h +=   "if(cur>0&&cur<=7)document.getElementById(BID[cur]).className='btn '+BCLS[cur]+' on';";
-    h +=   "if(cur===0)document.getElementById('b0').className='btn sb on';";
-    h +=   "document.getElementById('st').textContent=(m===0?'Standby':m===8?'FOLD':BLB[m])+' | TX:'+tx;";
-    h += "}";
-    h += "function tap(m,cmd){if(ws&&ws.readyState===1)ws.send(cmd);}";
-    h += "function connect(){";
-    h +=   "ws=new WebSocket('ws://'+location.hostname+'/ws');";
-    h +=   "ws.onclose=function(){setTimeout(connect,1000);};";
-    h +=   "ws.onmessage=function(e){";
-    h +=     "var d=JSON.parse(e.data);";
-    h +=     "if(d.mode!==undefined){upd(d.mode,d.tx);}";
-    h +=     "else if(d.cfg){";
-    h +=       "vals=d.cfg;";
-    h +=       "for(var i=0;i<8;i++){var el=document.getElementById('sv'+i);if(el)el.textContent=vals[i];}";
-    h +=     "}else if(d.scfg){";
-    h +=       "svals=d.scfg;";
-    h +=       "for(var i=0;i<8;i++){var el=document.getElementById('ss'+i);if(el)el.textContent=svals[i];}";
-    h +=     "}else if(d.saved){";
-    h +=       "var el=document.getElementById('saveMsg');";
-    h +=       "el.textContent='保存済み！';";
-    h +=       "setTimeout(function(){el.textContent='';},2000);";
-    h +=     "}";
-    h +=   "};";
-    h += "}";
-    h += "buildCfg();connect();";
-    h += "</script></div></body></html>";
-    req->send(200,"text/html",h);
-  });
-
-  server.begin();
-  goStandby(); delay(800);
-  drawDisp();
-}
-
-// ── loop ──────────────────────────────────────────────────────
-void loop() {
-  M5.update();
-  uint8_t m = mode;
-
-  switch (m) {
-
-    // ── SWEEP: 動作確認用スイープ ───────────────────────────────
-    case M_SWEEP:
-      kneeInGA(LIFT, MS_MOVE);
-      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_MOVE);
-      kneeStdGB(MS_MOVE);
-      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_MOVE);
-      if(!waitM(m, MS_MOVE+200)) break;
-      goStandby();
-      if(!waitM(m, MS_MOVE+200)) break;
-      kneeInGB(LIFT, MS_MOVE);
-      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_MOVE);
-      kneeStdGA(MS_MOVE);
-      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_MOVE);
-      if(!waitM(m, MS_MOVE+200)) break;
-      goStandby();
-      waitM(m, MS_MOVE+200);
-      break;
-
-    // ── STEP: 対角2脚交互足踏み ─────────────────────────────────
-    // フェーズ1: GA(右前ID4,6 + 左後ID0,2)
-    //   肩1,5上げ → 膝3,7内側（垂直保持）
-    //   肩1,5下げ → 膝3,7外側
-    //   スタンバイへ
-    // フェーズ2: GB(左前ID5,7 + 右後ID1,3) 同様
-    case M_STEP:
-      // フェーズ1: GA 持ち上げ（肩上げ＋膝内側）
-      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_WALK);
-      kneeInGA(LIFT, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      // GA 踏み込み（肩下げ＋膝外側）
-      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_WALK);
-      kneeOutGA(LIFT, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      // GA スタンバイへ
-      sendRelGrp(SHOULDER_A, 2, 0, MS_WALK);
-      kneeStdGA(MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      // フェーズ2: GB 持ち上げ（肩上げ＋膝内側）
-      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_WALK);
-      kneeInGB(LIFT, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      // GB 踏み込み（肩下げ＋膝外側）
-      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_WALK);
-      kneeOutGB(LIFT, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      // GB スタンバイへ
-      sendRelGrp(SHOULDER_B, 2, 0, MS_WALK);
-      kneeStdGB(MS_WALK);
-      waitM(m, MS_WALK);
-      break;
-
-    // ── FWD: 前進（対角歩行）────────────────────────────────────
-    case M_FWD:
-      // フェーズ1: GA持ち上げ前へ＋GB蹴り
-      kneeInGA(LIFT, MS_WALK);
-      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_WALK);
-      kneeStdGB(MS_WALK);
-      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      // GA着地
-      kneeStdGA(MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      // フェーズ2: GB持ち上げ前へ＋GA蹴り
-      kneeInGB(LIFT, MS_WALK);
-      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_WALK);
-      kneeStdGA(MS_WALK);
-      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      // GB着地
-      kneeStdGB(MS_WALK);
-      waitM(m, MS_WALK);
-      break;
-
-    // ── BACK: 後退（肩方向をFWDの逆に）────────────────────────
-    case M_BACK:
-      kneeInGA(LIFT, MS_WALK);
-      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_WALK);
-      kneeStdGB(MS_WALK);
-      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      kneeStdGA(MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      kneeInGB(LIFT, MS_WALK);
-      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_WALK);
-      kneeStdGA(MS_WALK);
-      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      kneeStdGB(MS_WALK);
-      waitM(m, MS_WALK);
-      break;
-
-    // ── LEFT: 左旋回 ────────────────────────────────────────────
-    case M_LEFT:
-      // 左側持ち上げ＋後ろへ、右側は前へ
-      kneeInGL(LIFT, MS_WALK);
-      sendRelGrp(GL_SH, 2, -STRIDE, MS_WALK);
-      kneeStdGR(MS_WALK);
-      sendRelGrp(GR_SH, 2, +STRIDE, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      kneeStdGL(MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      // 右側持ち上げ＋後ろへ、左側は前へ
-      kneeInGR(LIFT, MS_WALK);
-      sendRelGrp(GR_SH, 2, -STRIDE, MS_WALK);
-      kneeStdGL(MS_WALK);
-      sendRelGrp(GL_SH, 2, +STRIDE, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      kneeStdGR(MS_WALK);
-      waitM(m, MS_WALK);
-      break;
-
-    // ── RIGHT: 右旋回（LEFTの肩方向を逆に）────────────────────
-    case M_RIGHT:
-      kneeInGR(LIFT, MS_WALK);
-      sendRelGrp(GR_SH, 2, -STRIDE, MS_WALK);
-      kneeStdGL(MS_WALK);
-      sendRelGrp(GL_SH, 2, +STRIDE, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      kneeStdGR(MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      kneeInGL(LIFT, MS_WALK);
-      sendRelGrp(GL_SH, 2, -STRIDE, MS_WALK);
-      kneeStdGR(MS_WALK);
-      sendRelGrp(GR_SH, 2, +STRIDE, MS_WALK);
-      if(!waitM(m, MS_WALK)) break;
-      kneeStdGL(MS_WALK);
-      waitM(m, MS_WALK);
-      break;
-
-    // ── STRETCH: 全脚同時に屈伸 ─────────────────────────────────
-    case M_STRETCH:
-      // 全脚持ち上げ（膝内側＋肩上げ）
-      kneeInGA(LIFT, MS_STR);
-      kneeInGB(LIFT, MS_STR);
-      sendRelGrp(SHOULDER_A, 2, +STRIDE, MS_STR);
-      sendRelGrp(SHOULDER_B, 2, +STRIDE, MS_STR);
-      if(!waitM(m, MS_STR+200)) break;
-      goStandby();
-      if(!waitM(m, MS_STR+200)) break;
-      // 全脚沈み込み（膝外側＋肩下げ）
-      kneeOutGA(LIFT, MS_STR);
-      kneeOutGB(LIFT, MS_STR);
-      sendRelGrp(SHOULDER_A, 2, -STRIDE, MS_STR);
-      sendRelGrp(SHOULDER_B, 2, -STRIDE, MS_STR);
-      if(!waitM(m, MS_STR+200)) break;
-      goStandby();
-      waitM(m, MS_STR+200);
-      break;
-
-    case M_FOLD:
-    default:
-      delay(20);
-      break;
+  if(!M5.Imu.isEnabled()){
+    Serial.println("IMU not found!");
   }
 
-  static unsigned long lastD = 0;
-  if (millis()-lastD > 500) { lastD=millis(); drawDisp(); }
+  get_theta();
+  kalmanX.setAngle(theta_X);
+  kalmanY.setAngle(theta_Y);
+
+  delay(200);
+
+
+  //parameter memory
+  preferences.begin("parameter", false);
+
+  wakeUpAngle = preferences.getFloat("wakeUpAngle", wakeUpAngle);
+
+  Kp = preferences.getFloat("Kp", Kp);
+  Kd = preferences.getFloat("Kd", Kd);
+
+  period = preferences.getInt("period", period);
+  x = preferences.getInt("x", x);
+  height = preferences.getInt("height", height);
+  upHeight = preferences.getInt("upHeight", upHeight);
+  stride = preferences.getInt("stride", stride);
+  servoSpeed = preferences.getInt("servoSpeed", servoSpeed);
+
+  // 残留データの安全補正：過去のテストで保存された極端値で暴れるのを防ぐ。
+  // 特に period が小さすぎると歩行ループが高速回転して危険。
+  period     = constrain(period,     40, 3000);
+  upHeight   = constrain(upHeight,    0,   60);
+  stride     = constrain(stride,      0,   40);
+  servoSpeed = constrain(servoSpeed, 20, 1000);
+
+  // サーボoffset（キャリブレーション値）の読み込み
+  for(int i = 0; i < 8; i++){
+    char key[6];
+    snprintf(key, sizeof(key), "off%d", i);
+    offset[i] = preferences.getInt(key, offset[i]);
+  }
+
+  // 起動直後はキャリブレーションモードで全サーボをセンター保持
+  Mode = Calib;
+
+
+  WiFi.softAP(ssid, pass);
+  delay(100);
+  WiFi.softAPConfig(ip, ip, subnet);
+
+  IPAddress myIP = WiFi.softAPIP();
+
+
+  // ページ表示のみGET。動作系はすべてPOST専用（GET先読みでの誤発火防止）。
+  server.on("/", HTTP_GET, handleRoot);
+
+  server.on("/Jump", HTTP_POST, handleJump);
+  server.on("/step", HTTP_POST, handleStep);
+  server.on("/imu", HTTP_POST, handleImu);
+  server.on("/stretch", HTTP_POST, handleStretch);
+  server.on("/ad", HTTP_POST, handleAd);
+  server.on("/back", HTTP_POST, handleBack);
+  server.on("/L", HTTP_POST, handleL);
+  server.on("/R", HTTP_POST, handleR);
+  server.on("/Roll", HTTP_POST, handleRoll);
+
+  // キャリブレーション
+  server.on("/calMode", HTTP_POST, handleCalibMode);
+  server.on("/standMode", HTTP_POST, handleStandMode);
+  server.on("/speedM", HTTP_POST, handleSpeedM);
+  server.on("/speedP", HTTP_POST, handleSpeedP);
+  server.on("/resetParams", HTTP_POST, handleResetParams);
+  server.on("/calNext", HTTP_POST, handleCalNext);
+  server.on("/calPrev", HTTP_POST, handleCalPrev);
+  server.on("/calP10", HTTP_POST, handleCalP10);
+  server.on("/calP1", HTTP_POST, handleCalP1);
+  server.on("/calM1", HTTP_POST, handleCalM1);
+  server.on("/calM10", HTTP_POST, handleCalM10);
+  server.on("/calReset", HTTP_POST, handleCalReset);
+
+
+  server.on("/wakeUpAngleM", HTTP_POST, handleWakeUpAngleM);
+  server.on("/wakeUpAngleP", HTTP_POST, handleWakeUpAngleP);
+
+  server.on("/KpM", HTTP_POST, handleKpM);
+  server.on("/KpP", HTTP_POST, handleKpP);
+  server.on("/KdM", HTTP_POST, handleKdM);
+  server.on("/KdP", HTTP_POST, handleKdP);
+
+  server.on("/periodM", HTTP_POST, handlePeriodM);
+  server.on("/periodP", HTTP_POST, handlePeriodP);
+  server.on("/xM", HTTP_POST, handlexM);
+  server.on("/xP", HTTP_POST, handlexP);
+  server.on("/heightM", HTTP_POST, handleHeightM);
+  server.on("/heightP", HTTP_POST, handleHeightP);
+  server.on("/upHeightM", HTTP_POST, handleUpHeightM);
+  server.on("/upHeightP", HTTP_POST, handleUpHeightP);
+  server.on("/strideM", HTTP_POST, handleStrideM);
+  server.on("/strideP", HTTP_POST, handleStrideP);
+
+  server.begin();
+
+  //browser task
+  xTaskCreatePinnedToCore(
+    browser
+    ,  "browser"   // A name just for humans
+    ,  4096  // This stack size can be checked & adjusted by reading the Stack Highwater
+    ,  NULL
+    ,  1  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
+    ,  NULL
+    ,  0);
+}
+
+
+void loop() {
+  nowTime = micros();
+  loopTime = nowTime - oldTime;
+  oldTime = nowTime;
+
+  dt = (float)loopTime / 1000000.0; //sec
+
+  get_theta();
+  get_gyro_data();
+
+  //カルマンフィルタ 姿勢 傾き
+  kalAngleX = kalmanX.getAngle(theta_X, theta_Xdot, dt);
+  kalAngleY = kalmanY.getAngle(theta_Y, theta_Ydot, dt);
+
+  //カルマンフィルタ 姿勢 角速度
+  kalAngleDotX = kalmanX.getRate();
+  kalAngleDotY = kalmanY.getRate();
+
+  //Serial.println(kalAngleX);
+
+
+  if(Mode == Calib){ //キャリブレーション：全サーボをセンター(511+offset)で保持
+    for(int i = 0; i < 8; i++){
+      servo_write(i, 0);
+    }
+    delay(20);
+  }else if(Mode == Jump){ //ジャンプ
+    fRIK(20, 35);
+    fLIK(20, 35);
+    rLIK(-25, 95);
+    rRIK(-25, 95);
+    delay(500);
+
+    fRIK(-35, 100);
+    fLIK(-35, 100);
+    delay(160);
+
+
+    rRIK(107, -42);
+    rLIK(107, -42);
+    fRIK(-70, 90);
+    fLIK(-70, 90);
+    delay(100);
+
+    rRIK(80, 30);
+    rLIK(80, 30);
+
+    Mode = Jump2;
+
+    fRIK(-85, 40);
+    fLIK(-85, 40);
+
+  }else if(Mode == Jump2){
+    if(kalAngleX < 0.0 && kalAngleX > wakeUpAngle){
+      fRIK(60, 40);
+      fLIK(60, 40);
+      rRIK(60, 40);
+      rLIK(60, 40);
+
+      Mode = 0;
+    }
+  }else if(Mode == Stretch){ //屈伸
+    float tim,tt;
+    unsigned long time_mSt= millis();
+
+    tim=0;
+    while(tim<period * 8){
+      tim=millis()-time_mSt;
+      tt=float(tim * 2 * PI / (period * 8));
+      fRIK(x, height + upHeight * sin(tt));
+      fLIK(x, height + upHeight * sin(tt));
+      rLIK(x, height + upHeight * sin(tt));
+      rRIK(x, height + upHeight * sin(tt));
+    }
+  }else if(Mode == Step){ //足踏み
+    float tim,tt;
+    unsigned long time_mSt= millis();
+
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x, height + upHeight * (0.5 * cos(2*tt) - 0.5));
+      fLIK(x, height);
+      rLIK(x, height + upHeight * (0.5 * cos(2*tt) - 0.5));
+      rRIK(x, height);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x, height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+      fLIK(x, height);
+      rLIK(x, height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+      rRIK(x, height);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x, height);
+      fLIK(x, height + upHeight * (0.5 * cos(2*tt) - 0.5));
+      rLIK(x, height);
+      rRIK(x, height + upHeight * (0.5 * cos(2*tt) - 0.5));
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x, height);
+      fLIK(x, height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+      rLIK(x, height);
+      rRIK(x, height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+    }
+  }else if(Mode == Advance){ //前進
+    float tim,tt;
+    unsigned long time_mSt= millis();
+
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x - stride * cos(tt), height + upHeight * (0.5 * cos(2*tt) - 0.5));
+      fLIK(x + stride * cos(tt), height);
+      rLIK(x + stride * cos(tt), height + upHeight * (0.5 * cos(2*tt) - 0.5));
+      rRIK(x - stride * cos(tt), height);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x + stride * sin(tt), height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+      fLIK(x - stride * sin(tt), height);
+      rLIK(x - stride * sin(tt), height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+      rRIK(x + stride * sin(tt), height);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x + stride * cos(tt), height);
+      fLIK(x - stride * cos(tt), height + upHeight * (0.5 * cos(2*tt) - 0.5));
+      rLIK(x - stride * cos(tt), height);
+      rRIK(x + stride * cos(tt), height + upHeight * (0.5 * cos(2*tt) - 0.5));
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x - stride * sin(tt), height);
+      fLIK(x + stride * sin(tt), height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+      rLIK(x + stride * sin(tt), height);
+      rRIK(x - stride * sin(tt), height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+    }
+  }else if(Mode == Back){ //後進
+    float tim,tt;
+    unsigned long time_mSt= millis();
+
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x + stride * cos(tt), height + upHeight * (0.5 * cos(2*tt) - 0.5));
+      fLIK(x - stride * cos(tt), height);
+      rLIK(x - stride * cos(tt), height + upHeight * (0.5 * cos(2*tt) - 0.5));
+      rRIK(x + stride * cos(tt), height);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x - stride * sin(tt), height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+      fLIK(x + stride * sin(tt), height);
+      rLIK(x + stride * sin(tt), height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+      rRIK(x - stride * sin(tt), height);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x - stride * cos(tt), height);
+      fLIK(x + stride * cos(tt), height + upHeight * (0.5 * cos(2*tt) - 0.5));
+      rLIK(x + stride * cos(tt), height);
+      rRIK(x - stride * cos(tt), height + upHeight * (0.5 * cos(2*tt) - 0.5));
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(x + stride * sin(tt), height);
+      fLIK(x - stride * sin(tt), height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+      rLIK(x - stride * sin(tt), height);
+      rRIK(x + stride * sin(tt), height + upHeight * (-0.5 * cos(2*tt) - 0.5));
+    }
+  }else if(Mode == R){ //R
+    float tim,tt;
+    unsigned long time_mSt= millis();
+
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(10, 40 + 10 * (0.5 * cos(2*tt) - 0.5));
+      fLIK(10 + 10 * cos(tt), 40);
+      rLIK(10 + 10 * cos(tt), 40 + 10 * (0.5 * cos(2*tt) - 0.5));
+      rRIK(10, 40);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(10, 40 + 10 * (-0.5 * cos(2*tt) - 0.5));
+      fLIK(10 - 10 * sin(tt), 40);
+      rLIK(10 - 10 * sin(tt), 40 + 10 *(-0.5 * cos(2*tt) - 0.5));
+      rRIK(10, 40);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(10, 40);
+      fLIK(10 - 10 * cos(tt), 40 + 10 * (0.5 * cos(2*tt) - 0.5));
+      rLIK(10 - 10 * cos(tt), 40);
+      rRIK(10, 40 + 10 * (0.5 * cos(2*tt) - 0.5));
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(10, 40);
+      fLIK(10 + 10 * sin(tt), 40 + 10 * (-0.5 * cos(2*tt) - 0.5));
+      rLIK(10 + 10 * sin(tt), 40);
+      rRIK(10, 40 + 10 * (-0.5 * cos(2*tt) - 0.5));
+    }
+  }else if(Mode == L){ //L
+    float tim,tt;
+    unsigned long time_mSt= millis();
+
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(10 - 10 * cos(tt), 40 + 10 * (0.5 * cos(2*tt) - 0.5));
+      fLIK(10, 40);
+      rLIK(10, 40 + 10 * (0.5 * cos(2*tt) - 0.5));
+      rRIK(10 - 10 * cos(tt), 40);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(10 + 10 * sin(tt), 40 + 10 * (-0.5 * cos(2*tt) - 0.5));
+      fLIK(10, 40);
+      rLIK(10, 40 + 10 *(-0.5 * cos(2*tt) - 0.5));
+      rRIK(10 + 10 * sin(tt), 40);
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(10 + 10 * cos(tt), 40);
+      fLIK(10, 40 + 10 * (0.5 * cos(2*tt) - 0.5));
+      rLIK(10, 40);
+      rRIK(10 + 10 * cos(tt), 40 + 10 * (0.5 * cos(2*tt) - 0.5));
+    }
+
+    time_mSt= millis();
+    tim=0;
+    while(tim<period){
+      tim=millis()-time_mSt;
+      tt=float(tim * PI / 2 / period);
+      fRIK(10 - 10 * sin(tt), 40);
+      fLIK(10, 40 + 10 * (-0.5 * cos(2*tt) - 0.5));
+      rLIK(10, 40);
+      rRIK(10 - 10 * sin(tt), 40 + 10 * (-0.5 * cos(2*tt) - 0.5));
+    }
+  }else if(Mode == Roll){ //反転
+    fRIK(50, 30);
+    fLIK(50, 30);
+    rRIK(50, 30);
+    rLIK(50, 30);
+    delay(500);
+
+    fRIK(10, 45);
+    fLIK(10, 45);
+    rRIK(0, 80);
+    rLIK(0, 80);
+    delay(500);
+
+    fRIK(10, 90);
+    fLIK(10, 90);
+    delay(150);
+
+    fRIK(70, -50);
+    fLIK(70, -50);
+    delay(200);
+
+    rRIK(70, -50);
+    rLIK(70, -50);
+    delay(600);
+
+    Mode = 0;
+  }else if(Mode == Imu){
+    hX = hXpre + Kp / 100.0 * kalAngleX + Kd / 100.0 * kalAngleDotX;
+    hY = hYpre + Kp / 100.0 * kalAngleY + Kd / 100.0 * kalAngleDotY;
+
+    // 積分の発散防止（クランプ後の値を次回の積分に引き継ぐ）
+    hX = constrain(hX, -25.0, 25.0);
+    hY = constrain(hY, -25.0, 25.0);
+
+    hXpre = hX;
+    hYpre = hY;
+
+    if(pos == 1){ //反転時
+      hX = -hX;
+      hY = -hY;
+    }
+
+    fRIK(x, height - hX + hY);
+    fLIK(x, height - hX - hY);
+    rRIK(x, height + hX + hY);
+    rLIK(x, height + hX - hY);
+  }else{ //初期姿勢
+    fRIK(x, height);
+    fLIK(x, height);
+    rRIK(x, height);
+    rLIK(x, height);
+  }
+}
+
+
+//参考 https://qiita.com/Ninagawa123/items/7b79c5f5117dd1470ac9
+void scs_moveToPos(byte id, int position) {
+  // コマンドパケットを作成
+  byte message[13];
+  message[0] = 0xFF;  // ヘッダ
+  message[1] = 0xFF;  // ヘッダ
+  message[2] = id;    // サーボID
+  message[3] = 9;     // パケットデータ長
+  message[4] = 3;     // コマンド（3は書き込み命令）
+  message[5] = 42;    // レジスタ先頭番号
+  message[6] = (position >> 8) & 0xFF; // 位置情報バイト上位
+  message[7] = position & 0xFF; // 位置情報バイト下位
+  message[8] = 0x00;  // 時間（上位）：0=速度制御
+  message[9] = 0x00;  // 時間（下位）
+  message[10] = (servoSpeed >> 8) & 0xFF; // 速度（上位）。0=最高速、小さいほどゆっくり
+  message[11] = servoSpeed & 0xFF;        // 速度（下位）
+
+  // チェックサムの計算
+  byte checksum = 0;
+  for (int i = 2; i < 12; i++) {
+    checksum += message[i];
+  }
+  message[12] = ~checksum; // チェックサム
+
+  // コマンドパケットを送信
+  for (int i = 0; i < 13; i++) {
+    Serial1.write(message[i]);
+  }
+}
+
+
+void servo_write(int ch, float ang){
+  int sig = 511 + offset[ch] + int((512.0 / 150.0) * ang);
+  sig = constrain(sig, POS_MIN[ch], POS_MAX[ch]);  // 物理限界クランプ
+  scs_moveToPos(ch, sig);
+  // ペーシング：歩行ループがコマンドを連射してサーボが暴走するのを防ぐ。
+  // 8サーボ×1.5ms≒12ms（約80Hz）でSTANDも歩行も同じ滑らかさに揃える。
+  delayMicroseconds(1500);
+}
+
+
+
+//-------------------------------------------
+//IK
+//-------------------------------------------
+// 2リンクIK。foot(x,z) → th1[deg]=腿の角度（0で水平、+で脚が下がる）,
+//                        th2[deg]=膝の曲げ角（0で脚まっすぐ、+で足が下がる）。
+// 角度0は実機キャリブレーションの「水平」姿勢に一致（offsetで校正済み）。
+static void legIK(float x, float z, float &th1, float &th2){
+  float ld = sqrt(x*x + z*z);
+  float c1 = (L1*L1 - L2*L2 + ld*ld) / (2*L1*ld);
+  float c2 = (ld*ld - L1*L1 - L2*L2) / (2*L1*L2);
+  c1 = constrain(c1, -1.0f, 1.0f);   // 到達不能時の acos NaN を防止
+  c2 = constrain(c2, -1.0f, 1.0f);
+  float phi = atan2(x, z);
+  th1 = 90.0 - (phi + acos(c1)) * 180.0 / PI;
+  th2 = acos(c2) * 180.0 / PI;
+}
+
+// 実機計測（2026-06-13）に基づく取付符号：
+//   +方向=下がる … RL肩(0) RL膝(2) FR肩(4) FR膝(6) → +th
+//   +方向=上がる … RR肩(1) RR膝(3) FL肩(5) FL膝(7) → -th
+// 対角 RL+FR が (+,+)、RR+FL が (-,-)。
+// pos==1（裏返し）は本体が上下逆になるため符号反転（self-right用、要実機検証）。
+void fRIK(float x, float z){          // 前右 FR：肩ID4 膝ID6  (+th1,+th2)
+  float th1, th2; legIK(x, z, th1, th2);
+  float s = (pos == 0) ? 1.0f : -1.0f;
+  servo_write(4,  s * th1);
+  servo_write(6,  s * th2);
+}
+
+void fLIK(float x, float z){          // 前左 FL：肩ID5 膝ID7  (-th1,-th2)
+  float th1, th2; legIK(x, z, th1, th2);
+  float s = (pos == 0) ? 1.0f : -1.0f;
+  servo_write(5, -s * th1);
+  servo_write(7, -s * th2);
+}
+
+void rRIK(float x, float z){          // 後右 RR：肩ID1 膝ID3  (-th1,-th2)
+  float th1, th2; legIK(x, z, th1, th2);
+  float s = (pos == 0) ? 1.0f : -1.0f;
+  servo_write(1, -s * th1);
+  servo_write(3, -s * th2);
+}
+
+void rLIK(float x, float z){          // 後左 RL：肩ID0 膝ID2  (+th1,+th2)
+  float th1, th2; legIK(x, z, th1, th2);
+  float s = (pos == 0) ? 1.0f : -1.0f;
+  servo_write(0,  s * th1);
+  servo_write(2,  s * th2);
 }
