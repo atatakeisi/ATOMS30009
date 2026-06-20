@@ -8,6 +8,9 @@
 #include <WebServer.h>
 
 #define TX_PIN 5
+// サーボバスのRX。HW改造でGPIO6を追加（TX側に1kΩ直列、RXはバス直結）。
+// これにより現在位置の READ 応答を受信できる（半二重シングルワイヤ）。
+#define RX_PIN 6
 
 WebServer server(80);
 const char ssid[] = "robot0009";  // SSID
@@ -100,6 +103,8 @@ int servoSpeed = 200;
 //-------------------------------------------------
 
 void scs_moveToPos(byte id, int position);
+bool scs_readPosition(byte id, int &outRaw);
+void softStartToHorizontal();
 void servo_write(int ch, float ang);
 void fRIK(float x, float z);
 void fLIK(float x, float z);
@@ -695,7 +700,7 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
 
-  Serial1.begin(1000000, SERIAL_8N1, -1, TX_PIN);
+  Serial1.begin(1000000, SERIAL_8N1, RX_PIN, TX_PIN);
 
   if(!M5.Imu.isEnabled()){
     Serial.println("IMU not found!");
@@ -798,6 +803,11 @@ void setup() {
   server.on("/strideP", HTTP_POST, handleStrideP);
 
   server.begin();
+
+  // 起動時ソフトスタート：各サーボの実際の現在位置を読み取り、そこから
+  // ゆっくり水平姿勢(511+offset)へ移行する。loop()のモード処理に入る前に一度だけ。
+  // （loop()はsetup()完了後に走り始めるため、ここで完了させておく）
+  softStartToHorizontal();
 
   //browser task
   xTaskCreatePinnedToCore(
@@ -1198,6 +1208,124 @@ void scs_moveToPos(byte id, int position) {
   for (int i = 0; i < 13; i++) {
     Serial1.write(message[i]);
   }
+}
+
+
+// サーボの現在位置(Present Position, レジスタ0x38=56, 2byte)を読む。
+// READ DATA命令=0x02。要求パケット(8byte):
+//   FF FF [id] 0x04 0x02 0x38 0x02 [checksum]
+//   checksum = (~(id + 0x04 + 0x02 + 0x38 + 0x02)) & 0xFF
+// 応答パケット(8byte):
+//   FF FF [id] 0x04 [error] [dataL] [dataH] [checksum]
+//   ※現在位置データは low byte first（WRITEのpositionとは逆順）。
+// 半二重シングルワイヤのため、送信した8byteが自分のRXへ自己エコーで返る。
+// そこで送信前後にRXをflushし、受信側ではヘッダ(FF FF)を探索して
+// 自己エコーと本当の応答を区別する。タイムアウト20ms、応答無しはfalse。
+bool scs_readPosition(byte id, int &outRaw) {
+  byte req[8];
+  req[0] = 0xFF;
+  req[1] = 0xFF;
+  req[2] = id;
+  req[3] = 0x04;  // 以降のバイト数（命令+アドレス+長さ+checksum）
+  req[4] = 0x02;  // READ DATA
+  req[5] = 0x38;  // Present Position レジスタ先頭(56)
+  req[6] = 0x02;  // 読み出し長(2byte)
+  byte cs = 0;
+  for (int i = 2; i < 7; i++) cs += req[i];
+  req[7] = ~cs;
+
+  // 送信前にRXバッファを空にして、古いデータと自己エコーの混入を減らす
+  while (Serial1.available()) Serial1.read();
+
+  for (int i = 0; i < 8; i++) Serial1.write(req[i]);
+  Serial1.flush();  // 送信完了まで待つ
+
+  // ヘッダ(FF FF)を探索しながら応答を受信する。
+  // 自己エコー（送信した8byte）も FF FF で始まるため、ヘッダ直後の
+  // [id][len] が応答フォーマット（len=0x04）かつchecksum一致するもののみ採用。
+  // 単純化のため、ヘッダ探索→8byte読み→検証 を取りこぼしなく行う。
+  unsigned long start = millis();
+  int state = 0;            // FF FF 検出用ステート
+  while (millis() - start < 20) {
+    if (!Serial1.available()) continue;
+    byte b = Serial1.read();
+
+    if (state < 2) {
+      // ヘッダ FF FF を待つ
+      if (b == 0xFF) state++;
+      else state = 0;
+      continue;
+    }
+
+    // ここで b はヘッダ直後の1byte目（= id のはず）
+    byte rid = b;
+    // 残り5byte（len, error, dataL, dataH, checksum）を集める
+    byte rest[5];
+    int got = 0;
+    while (got < 5 && millis() - start < 20) {
+      if (!Serial1.available()) continue;
+      rest[got++] = Serial1.read();
+    }
+    if (got < 5) return false;  // タイムアウト
+
+    byte len   = rest[0];
+    byte err   = rest[1];
+    byte dataL = rest[2];
+    byte dataH = rest[3];
+    byte rcs   = rest[4];
+
+    // 自己エコー（要求パケット FF FF id 04 02 38 02 cs）は
+    // len=0x04 だが続きが 02 38 ... のため checksum が合わない。
+    // READ応答の checksum = (~(id + len + error + dataL + dataH)) & 0xFF
+    byte calc = (~(rid + len + err + dataL + dataH)) & 0xFF;
+    if (rid == id && len == 0x04 && calc == rcs) {
+      outRaw = dataL | (dataH << 8);  // low byte first
+      return true;
+    }
+
+    // 不一致（自己エコー等）：ヘッダ探索からやり直す
+    state = 0;
+  }
+  return false;  // タイムアウト
+}
+
+
+// 起動時のソフトスタート：各サーボの現在位置を読み取り、そこから水平姿勢
+// (511+offset[id]) へ約20ステップ・合計800〜1000msかけてゆっくり補間移動する。
+// 読み取りに失敗したサーボは目標rawをそのまま使う（=ランプせずスキップ）。
+// ステップのループを外側、サーボのループを内側にして全軸を同期して動かす。
+void softStartToHorizontal() {
+  const int STEPS = 20;
+  const int STEP_DELAY = 45;  // ms。20step×45ms ≒ 900ms
+  int startRaw[8];
+  int targetRaw[8];
+
+  Serial.println("softStart: read current positions");
+  for (int id = 0; id < 8; id++) {
+    targetRaw[id] = constrain(511 + offset[id], POS_MIN[id], POS_MAX[id]);
+    int raw = 0;
+    if (scs_readPosition(id, raw)) {
+      startRaw[id] = raw;
+      Serial.printf("  ID%d read OK  raw=%d  target=%d\n", id, raw, targetRaw[id]);
+    } else {
+      // 失敗：目標値を始点にして、このサーボはランプしない
+      startRaw[id] = targetRaw[id];
+      Serial.printf("  ID%d read FAIL -> skip ramp (use target=%d)\n", id, targetRaw[id]);
+    }
+  }
+
+  Serial.println("softStart: ramp to horizontal");
+  for (int s = 1; s <= STEPS; s++) {
+    for (int id = 0; id < 8; id++) {
+      // 現在raw → 目標raw を線形補間
+      int posRaw = startRaw[id] + (targetRaw[id] - startRaw[id]) * s / STEPS;
+      posRaw = constrain(posRaw, POS_MIN[id], POS_MAX[id]);
+      scs_moveToPos(id, posRaw);
+      delayMicroseconds(1500);  // 既存の連射防止ペーシングに合わせる
+    }
+    delay(STEP_DELAY);  // ステップ間の待ち（既存ペーシングとは別）
+  }
+  Serial.println("softStart: done");
 }
 
 

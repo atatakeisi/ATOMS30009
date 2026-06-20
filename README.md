@@ -149,6 +149,35 @@ FF FF  ID  09  03  2A  posH posL  timeH timeL  spdH spdL  CS
 レジスタ42から 位置(42/43)・時間(44/45)・速度(46/47) を一括書き込み。
 本ファームは時間=0、速度=`servoSpeed`(ビッグエンディアン、posと同じ並び)。
 
+### 起動時ソフトスタート（現在位置を読んで水平へゆっくり移行）
+
+起動時に各サーボの**実際の現在位置を読み取り**、そこから水平姿勢
+(`511+offset[id]`) へ約20ステップ・合計約900msかけて補間移動する。
+`setup()` の末尾（NVS読込・`Serial1.begin()`・WiFi初期化の後）で
+`softStartToHorizontal()` を一度だけ呼ぶ。読み取り失敗したサーボは
+目標rawを始点にして**ランプせずスキップ**する。
+
+- **配線改造（HW）**: 現在位置の読み取りには受信線が必要。`GPIO6` を RX として
+  追加（`#define RX_PIN 6`、`Serial1.begin(..., RX_PIN, TX_PIN)`）。
+  TX(`GPIO5`)側に **1kΩを直列**、RXはバス側へ直結。
+- **READ DATA パケット**（命令=`0x02`、Present Position レジスタ=`0x38`/56、2byte）:
+  ```
+  要求(8byte): FF FF  ID  04  02  38  02  CS
+  応答(8byte): FF FF  ID  04  err  dataL dataH  CS
+  ```
+  応答の現在位置は **下位バイトが先(low byte first)** で、WRITEの並び(posH先)とは逆。
+- **半二重シングルワイヤの自己エコー対策**: 送信した8byteが自分のRXにも返るため、
+  送信前にRXをflush → ヘッダ(`FF FF`)を探索 → 続く`[id][len][err][dataL][dataH][CS]`を
+  集めて **チェックサム検証**(`~(id+len+err+dataL+dataH)`)。一致しなければ自己エコー等
+  とみなしヘッダ探索からやり直す。タイムアウト20ms、応答無しは`false`を返して
+  `setup()`がハングしないようにする。
+
+> **電源ON直後の一瞬のジャークについて**: サーボ内部MCUはESP32より先に起動し、
+> 投入と同時にトルクONして**前回のGoal Positionへ自前でスナップ**する。これは
+> `softStartToHorizontal()` が走る前の挙動なのでソフトでは消せない（仕様上の正常動作）。
+> 前回と同じ水平姿勢で電源を切っていれば、内部目標と物理位置がほぼ一致し初動はほぼ出ない。
+> 完全に無くすにはサーボ電源をESP32起動後に投入する電源シーケンス（MOSFET）が必要。
+
 ---
 
 ## Web UI（すべてPOST）
