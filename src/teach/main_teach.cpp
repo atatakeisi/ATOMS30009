@@ -1,48 +1,100 @@
-// ATOMS30009 Teaching / 計測再生ファーム — Phase 0 検証ハーネス
-// 目的: Teaching全体の前提を実機で確認する。
-//   (1) torque OFF 中に present position を READ できるか
-//   (2) torque ON 復帰をジャークなく行えるか（現在位置READ→ゴール書込→enable）
-//   (3) GPIO41(M5.BtnA) の短押し/長押し/ダブルクリック判定
+// ATOMS30009 Teaching ファーム — Phase 1（キーフレームTeaching中核 ＋ WiFi WebUI）
+// 目的: 手で姿勢を作り（torque OFF）、コマ(raw[8])を記録し、Linear補間で再生する。
+//   ATOMの画面は小さいので、iPad等のブラウザから WiFi AP 経由でUIを見て操作する。
 //
-// ★ 本ファームは prod(src/main.cpp) とは独立。env: m5stack-atoms3-teach で書き込む。
-//   Phase1〜4 は prod に触れないため、SCS/IK 等のコードは本ファイル側に重複する
-//   （較正offsetは同一NVS名前空間 "parameter" を共有してデータ二重化は避ける）。
+// ★ prod(src/main.cpp) とは独立。env: m5stack-atoms3-teach で書き込む。
+//   SCS/IK等のコードは重複するが、較正offsetは同一NVS名前空間 "parameter" を共有。
 //
-// 配線（HW改造済み）: サーボTX=GPIO5(1kΩ直列), RX=GPIO6(バス直結)。
-//   GPIO38/39 は内蔵IMUのI2Cのため絶対使用禁止。
+// 設計方針（docs/DESIGN.md）:
+//   - 操作系は全てPOST（GET先読みでの誤発火防止）。ページ表示 / と /status のみGET。
+//   - ライブ表示は /status(JSON) を数Hzポーリング。
+//   - サーボバス(半二重1Mbps)アクセスは loop 1スレッドに集約して競合を避ける。
+//   - 形(raw)だけ記録。重力下の力学は将来 Phase1.5 の計測再生で別取得する。
+//
+// 配線(HW改造済み): TX=GPIO5(1kΩ直列), RX=GPIO6(バス直結)。GPIO38/39は禁止。
 #include <M5Unified.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
 #define TX_PIN 5
 #define RX_PIN 6
 
 // SCS0009 レジスタ
-#define REG_GOAL_POSITION 0x2A  // 42: 位置(2)・時間(2)・速度(2)の先頭
-#define REG_TORQUE_ENABLE 0x28  // 40: 1=ON / 0=OFF
-#define REG_PRESENT_POS   0x38  // 56: 現在位置(2, low byte first)
+#define REG_GOAL_POSITION 0x2A  // 42
+#define REG_TORQUE_ENABLE 0x28  // 40 (1=ON / 0=OFF)
+#define REG_PRESENT_POS   0x38  // 56 (応答は上位バイト先=big-endian)
 
-// 起動時の安全のため低速で。0=最高速(危険)。
-int servoSpeed = 200;
+int servoSpeed = 200;  // 0=最高速(危険)。低速で安全に。
 
 Preferences preferences;
 
-//           ID     0    1    2    3    4    5    6    7   （prodと同じ較正値）
+//           ID     0    1    2    3    4    5    6    7  （prodと同じ較正値）
 int offset[] = { -35,   0,  13,  -7,  53, -44,  15,  34 };
 const int POS_MIN[8] = {60, 60, 60, 60, 60, 60, 60, 60};
 const int POS_MAX[8] = {960, 960, 960, 960, 960, 960, 960, 960};
+const char* LBL[8] = {"RL肩","RR肩","RL膝","RR膝","FR肩","FL肩","FR膝","FL膝"};
 
-bool torqueOn = true;  // 現在のトルク状態（全軸一括管理）
+bool torqueOn = true;
 
-// プロトタイプ（既存prodの慣習に合わせ上部にまとめる）
+// 現在位置キャッシュ（loopで定期READし、/statusはこれを返す＝バス連射を防ぐ）
+int  curRaw[8] = {511,511,511,511,511,511,511,511};
+bool curOk[8]  = {false,false,false,false,false,false,false,false};
+
+// キーフレーム（raw[8]）。Phase2でLittleFS永続化予定。今はRAMのみ。
+#define MAX_FRAMES 64
+uint16_t frames[MAX_FRAMES][8];
+int frameTransMs[MAX_FRAMES];   // 各コマへ「前コマ(or現在位置)から移行する時間」(ms)
+int frameCount = 0;
+int defTransMs = 600;           // 新規コマ記録時の既定移行時間(ms)
+
+// 再生（ノンブロッキング状態機械）。server応答とライブ表示を止めないため、
+// 1ステップずつ loop で進める。これにより「再生中コマ」をiPadへ反映できる。
+bool playing = false;
+int  playSeg = 0;               // 現在の移行先コマindex（=ハイライト対象）
+int  playStep = 0, playSteps = 0;
+uint16_t playFrom[8];
+unsigned long playLast = 0;
+const int PLAY_STEP_MS = 15;
+
+// WiFi AP（prodと同IP。SSIDはteachと分かるよう別名）
+WebServer server(80);
+const char ssid[] = "robot0009-teach";
+const char pass[] = "password";
+const IPAddress apIp(192, 168, 55, 27);
+const IPAddress apSubnet(255, 255, 255, 0);
+
+// プロトタイプ
 void scs_moveToPos(byte id, int position);
 bool scs_readPosition(byte id, int &outRaw);
 void scs_setTorque(byte id, bool on);
 void setTorqueAll(bool on);
-void readAllPositions();
 void torqueOnNoJerk();
-void diagReadDump(byte id);
-void drawHeader();
-void drawStatus(const char* line2);
+void refreshCache();
+void recordFrame();
+void undoFrame();
+void clearFrames();
+void deleteFrame(int idx);
+void startPlay();
+void tickPlay();
+void stopPlay();
+void drawLcd();
+// web
+void handleRoot();
+void handleStatus();
+void handleTorqueOff();
+void handleTorqueOn();
+void handleRecord();
+void handleUndo();
+void handleClear();
+void handlePlay();
+void handleTransM();
+void handleTransP();
+void handleFrameTransM();
+void handleFrameTransP();
+void handleDeleteFrame();
+void handleStop();
+void handleExport();
 
 
 void setup() {
@@ -52,9 +104,8 @@ void setup() {
   Serial.begin(115200);
   Serial1.begin(1000000, SERIAL_8N1, RX_PIN, TX_PIN);
 
-  // 較正offsetは prod と同じ NVS 名前空間から読む（データ二重化を避ける）
-  preferences.begin("parameter", true);  // read-only
-  for(int i = 0; i < 8; i++){
+  preferences.begin("parameter", true);  // prodと同じ名前空間からoffsetを読む
+  for (int i = 0; i < 8; i++) {
     char key[6];
     snprintf(key, sizeof(key), "off%d", i);
     offset[i] = preferences.getInt(key, offset[i]);
@@ -65,126 +116,109 @@ void setup() {
   M5.Display.setBrightness(60);
   M5.Display.fillScreen(TFT_BLACK);
 
-  Serial.println("\n=== Teaching Phase0 verify ===");
-  Serial.println(" short  : READ all present positions");
-  Serial.println(" hold   : TORQUE OFF (脱力)");
-  Serial.println(" double : TORQUE ON (無ジャーク復帰)");
-  drawStatus("ready");
+  WiFi.softAP(ssid, pass);
+  delay(100);
+  WiFi.softAPConfig(apIp, apIp, apSubnet);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/torqueOff", HTTP_POST, handleTorqueOff);
+  server.on("/torqueOn", HTTP_POST, handleTorqueOn);
+  server.on("/record", HTTP_POST, handleRecord);
+  server.on("/undo", HTTP_POST, handleUndo);
+  server.on("/clear", HTTP_POST, handleClear);
+  server.on("/play", HTTP_POST, handlePlay);
+  server.on("/transM", HTTP_POST, handleTransM);
+  server.on("/transP", HTTP_POST, handleTransP);
+  server.on("/frameTransM", HTTP_POST, handleFrameTransM);
+  server.on("/frameTransP", HTTP_POST, handleFrameTransP);
+  server.on("/deleteFrame", HTTP_POST, handleDeleteFrame);
+  server.on("/stop", HTTP_POST, handleStop);
+  server.on("/export", HTTP_GET, handleExport);  // GET=ダウンロード（副作用なし）
+  server.begin();
+
+  Serial.printf("Teaching Phase1 up. AP=%s IP=%s\n", ssid, apIp.toString().c_str());
+  drawLcd();
 }
 
 
 void loop() {
-  M5.update();  // ★ prodと違い teach ではボタン判定のため必須
+  M5.update();  // ボタン判定に必須
 
-  if(M5.BtnA.wasClicked()){
-    Serial.println("[btn] short -> read all");
-    readAllPositions();   // 全8軸の現在位置をLCDへ（diagReadDumpは診断用に残置）
-  }
-  if(M5.BtnA.wasHold()){
-    Serial.println("[btn] hold -> torque OFF");
-    setTorqueAll(false);
-    drawStatus("TORQUE OFF");
-  }
-  if(M5.BtnA.wasDoubleClicked()){
-    Serial.println("[btn] double -> torque ON (no jerk)");
-    torqueOnNoJerk();   // 内部でLCDに "ON n/8" を表示する
+  // 物理ボタン（iPadが無くても基本操作ができるよう残す）。再生中は無効。
+  if (!playing) {
+    if (M5.BtnA.wasClicked())       { recordFrame(); drawLcd(); }   // 短押し: コマ記録
+    if (M5.BtnA.wasHold())          { setTorqueAll(false); drawLcd(); }  // 長押し: 脱力
+    if (M5.BtnA.wasDoubleClicked()) { torqueOnNoJerk(); drawLcd(); }     // ダブル: 無ジャークON
   }
 
-  delay(10);
+  server.handleClient();
+  tickPlay();   // 再生中なら1ステップ進める（serverを止めない）
+
+  // 現在位置キャッシュを定期更新（約250ms）。iPadのライブ表示用。再生中はバスを再生に使うので休止。
+  static unsigned long lastRead = 0;
+  if (!playing && millis() - lastRead >= 250) {
+    lastRead = millis();
+    refreshCache();
+    drawLcd();
+  }
+
+  delay(2);
 }
 
 
 // ===== SCS0009 通信 =====
-// 参考 https://qiita.com/Ninagawa123/items/7b79c5f5117dd1470ac9
 void scs_moveToPos(byte id, int position) {
-  byte message[13];
-  message[0] = 0xFF; message[1] = 0xFF;
-  message[2] = id;
-  message[3] = 9;                  // データ長
-  message[4] = 3;                  // WRITE
-  message[5] = REG_GOAL_POSITION;
-  message[6] = (position >> 8) & 0xFF;  // posH
-  message[7] = position & 0xFF;         // posL
-  message[8] = 0x00;  message[9] = 0x00;             // 時間(0)=速度制御
-  message[10] = (servoSpeed >> 8) & 0xFF;            // spdH
-  message[11] = servoSpeed & 0xFF;                   // spdL
-  byte checksum = 0;
-  for (int i = 2; i < 12; i++) checksum += message[i];
-  message[12] = ~checksum;
-  for (int i = 0; i < 13; i++) Serial1.write(message[i]);
+  byte m[13];
+  m[0]=0xFF; m[1]=0xFF; m[2]=id; m[3]=9; m[4]=3; m[5]=REG_GOAL_POSITION;
+  m[6]=(position>>8)&0xFF; m[7]=position&0xFF;       // posH, posL
+  m[8]=0x00; m[9]=0x00;                              // 時間0=速度制御
+  m[10]=(servoSpeed>>8)&0xFF; m[11]=servoSpeed&0xFF; // spdH, spdL
+  byte cs=0; for(int i=2;i<12;i++) cs+=m[i]; m[12]=~cs;
+  for(int i=0;i<13;i++) Serial1.write(m[i]);
 }
 
-
-// トルクON/OFF。レジスタ0x28に 1/0 を書き込む。
-//   FF FF ID 04 03 28 EN CS   CS = ~(ID + 04 + 03 + 28 + EN)
 void scs_setTorque(byte id, bool on) {
-  byte msg[8];
-  msg[0] = 0xFF; msg[1] = 0xFF;
-  msg[2] = id;
-  msg[3] = 0x04;              // データ長
-  msg[4] = 0x03;             // WRITE
-  msg[5] = REG_TORQUE_ENABLE;
-  msg[6] = on ? 0x01 : 0x00;
-  byte cs = 0;
-  for (int i = 2; i < 7; i++) cs += msg[i];
-  msg[7] = ~cs;
-  for (int i = 0; i < 8; i++) Serial1.write(msg[i]);
+  byte m[8];
+  m[0]=0xFF; m[1]=0xFF; m[2]=id; m[3]=0x04; m[4]=0x03; m[5]=REG_TORQUE_ENABLE;
+  m[6]= on ? 0x01 : 0x00;
+  byte cs=0; for(int i=2;i<7;i++) cs+=m[i]; m[7]=~cs;
+  for(int i=0;i<8;i++) Serial1.write(m[i]);
 }
 
-
-// 現在位置(Present Position 0x38, 2byte, low byte first)を読む。
-// 半二重シングルワイヤのため送信8byteが自RXに自己エコーする。
-// 送信前にflush→ヘッダ(FF FF)探索→checksum検証で本応答のみ採用。タイムアウト20ms。
+// 現在位置READ。応答 FF FF id 04 err posH posL cs（位置は上位バイト先=big-endian）。
+// 半二重の自己エコー(送信8byte)を先にバイト数で読み捨ててから応答を探す。タイムアウト20ms。
 bool scs_readPosition(byte id, int &outRaw) {
   byte req[8];
-  req[0] = 0xFF; req[1] = 0xFF;
-  req[2] = id;
-  req[3] = 0x04;            // データ長
-  req[4] = 0x02;           // READ DATA
-  req[5] = REG_PRESENT_POS;
-  req[6] = 0x02;           // 2byte
-  byte cs = 0;
-  for (int i = 2; i < 7; i++) cs += req[i];
-  req[7] = ~cs;
+  req[0]=0xFF; req[1]=0xFF; req[2]=id; req[3]=0x04;
+  req[4]=0x02; req[5]=REG_PRESENT_POS; req[6]=0x02;
+  byte cs=0; for(int i=2;i<7;i++) cs+=req[i]; req[7]=~cs;
 
-  while (Serial1.available()) Serial1.read();   // 古いデータ/自己エコー残りを掃除
-  for (int i = 0; i < 8; i++) Serial1.write(req[i]);
-  Serial1.flush();                              // 送信完了待ち
+  while (Serial1.available()) Serial1.read();
+  for (int i=0;i<8;i++) Serial1.write(req[i]);
+  Serial1.flush();
 
-  // ★ 自己エコー対策の核心：送信した8byteは必ずRXに返る。READ要求のエコーは
-  //   応答用checksum式 ~(id+len+err+dataL+dataH) を偶然満たし 0x238=568 を返すため、
-  //   ヘッダ＋checksumでは区別できない。よって先に8byteを「バイト数で」読み捨てる。
-  int skipped = 0;
-  unsigned long te = millis();
-  while (skipped < 8 && millis() - te < 20) {
-    if (Serial1.available()) { Serial1.read(); skipped++; }
-  }
+  // 自己エコー8byteを読み捨て（READ要求のエコーは応答checksum式を偶然満たすため必須）
+  int skipped=0; unsigned long te=millis();
+  while (skipped<8 && millis()-te<20) { if(Serial1.available()){Serial1.read();skipped++;} }
 
-  unsigned long start = millis();
-  int state = 0;  // FF FF 検出
-  while (millis() - start < 20) {
+  unsigned long start=millis();
+  int state=0;
+  while (millis()-start < 20) {
     if (!Serial1.available()) continue;
-    byte b = Serial1.read();
-    if (state < 2) { state = (b == 0xFF) ? state + 1 : 0; continue; }
-
-    byte rid = b;            // ヘッダ直後 = id のはず
-    byte rest[5]; int got = 0;
-    while (got < 5 && millis() - start < 20) {
-      if (Serial1.available()) rest[got++] = Serial1.read();
+    byte b=Serial1.read();
+    if (state<2) { state=(b==0xFF)?state+1:0; continue; }
+    byte rid=b; byte rest[5]; int got=0;
+    while (got<5 && millis()-start<20) { if(Serial1.available()) rest[got++]=Serial1.read(); }
+    if (got<5) return false;
+    byte len=rest[0], err=rest[1], posH=rest[2], posL=rest[3], rcs=rest[4];
+    byte calc=(~(rid+len+err+posH+posL))&0xFF;
+    if (rid==id && len==0x04 && calc==rcs) {
+      int v=(posH<<8)|posL;          // big-endian
+      if (v<0 || v>1023) return false;
+      outRaw=v; return true;
     }
-    if (got < 5) return false;
-
-    // 応答: FF FF id len err posH posL cs（★位置は上位バイト先＝big-endian。
-    //   実機ダンプで確定。プロンプトの仕様書「low byte first」は誤りだった）
-    byte len = rest[0], err = rest[1], posH = rest[2], posL = rest[3], rcs = rest[4];
-    byte calc = (~(rid + len + err + posH + posL)) & 0xFF;
-    if (rid == id && len == 0x04 && calc == rcs) {
-      int v = (posH << 8) | posL;
-      if (v < 0 || v > 1023) return false;  // 範囲外＝フレーム不正として弾く
-      outRaw = v;
-      return true;
-    }
-    state = 0;  // 自己エコー等 → ヘッダ探索やり直し
+    state=0;
   }
   return false;
 }
@@ -192,135 +226,217 @@ bool scs_readPosition(byte id, int &outRaw) {
 
 // ===== 高レベル操作 =====
 void setTorqueAll(bool on) {
-  for (int id = 0; id < 8; id++) {
-    scs_setTorque(id, on);
-    delayMicroseconds(1500);  // prod のペーシングに合わせる
-  }
+  for (int id=0; id<8; id++) { scs_setTorque(id,on); delayMicroseconds(1500); }
   torqueOn = on;
 }
 
-
-// 全8サーボの現在位置をREADしてLCDへ全軸表示（Serialは補助）。
-// ★ 筐体組み込み=バッテリー駆動時はUSB不可のため、検証は必ずLCDで完結させる。
-//   torque OFF 中に手で動かしながら短押しし、8軸の値が追従すれば「OFF中READ可」の確認。
-void readAllPositions() {
-  int raw[8];
-  bool ok[8];
-  Serial.print("present:");
-  for (int id = 0; id < 8; id++) {
-    ok[id] = scs_readPosition(id, raw[id]);
-    if (ok[id]) Serial.printf(" %d=%d", id, raw[id]);
-    else        Serial.printf(" %d=FAIL", id);
-  }
-  Serial.println();
-
-  // LCD: 8軸を2列×4行で表示（左列 ID0-3 / 右列 ID4-7）。
-  // 値は最大1023(4桁)になり得るので、桁あふれしないよう文字サイズ1・余裕ある列幅にする。
-  M5.Display.fillScreen(TFT_BLACK);
-  drawHeader();
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  for (int id = 0; id < 8; id++) {
-    int xx = 4 + (id / 4) * 66;   // 左 x=4 / 右 x=70（4桁でも重ならない）
-    int yy = 32 + (id % 4) * 18;  // 4行
-    M5.Display.setCursor(xx, yy);
-    if (ok[id]) M5.Display.printf("%d:%4d", id, raw[id]);
-    else        M5.Display.printf("%d:----", id);
-  }
-}
-
-
-// 【診断】ID へ READ要求を出し、受信した生バイト列をそのままHEXでLCDに出す。
-// echo(送信8byte) + サーボ応答 が連続して見えるはず。これで本当のフレーム構造
-// （FF FF の位置・lengthバイト・位置データの並び）を目視確認し、パーサを確定する。
-void diagReadDump(byte id) {
-  byte req[8];
-  req[0]=0xFF; req[1]=0xFF; req[2]=id; req[3]=0x04;
-  req[4]=0x02; req[5]=REG_PRESENT_POS; req[6]=0x02;
-  byte cs=0; for(int i=2;i<7;i++) cs+=req[i]; req[7]=~cs;
-
-  while (Serial1.available()) Serial1.read();   // 受信バッファ掃除
-  for (int i=0;i<8;i++) Serial1.write(req[i]);
-  Serial1.flush();
-
-  // 受信を全部キャプチャ（skipせず、echoも応答もまとめて）
-  byte buf[32]; int n=0;
-  unsigned long t0=millis();
-  while (millis()-t0 < 25 && n < 32) {
-    if (Serial1.available()) buf[n++]=Serial1.read();
-  }
-
-  // Serial（つながっていれば）
-  Serial.printf("diag id%d n=%d:", id, n);
-  for (int i=0;i<n;i++) Serial.printf(" %02X", buf[i]);
-  Serial.println();
-
-  // LCD: 上に件数、以下 6byte/行 でHEX
-  M5.Display.fillScreen(TFT_BLACK);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
-  M5.Display.setCursor(2,2);
-  M5.Display.printf("READ id%d  n=%d", id, n);
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  for (int i=0;i<n;i++) {
-    int col=i%6, row=i/6;
-    M5.Display.setCursor(2 + col*21, 16 + row*13);
-    M5.Display.printf("%02X", buf[i]);
-  }
-}
-
-
-// 無ジャーク torque ON：①全軸READ → ②現在位置をゴール書込 → ③torque ENABLE。
-// ★ READとWRITEを「フェーズ分離」する。1軸ずつ交互にやると書き込みの自己エコーが
-//   次のREADに混入して誤った位置をゴールに書き、跳ねる（実機で確認された）。
-// ★ READ失敗軸はトルクを入れない（旧ゴールへスナップして跳ねるのを防ぐ安全策）。
+// 無ジャークON：①全軸READ ②現在位置をゴール書込 ③torque ENABLE（フェーズ分離）。
+// READ失敗軸はトルクを入れない（旧ゴールへ跳ねるのを防ぐ）。
 void torqueOnNoJerk() {
-  int raw[8];
-  bool ok[8];
-  int nok = 0;
-
-  // ① 全軸READ（読みフェーズを独立させてエコー混入を防ぐ）
-  for (int id = 0; id < 8; id++) { ok[id] = scs_readPosition(id, raw[id]); if (ok[id]) nok++; }
-
-  // ② 読めた軸だけ、現在位置をそのままゴールに書く
-  for (int id = 0; id < 8; id++) {
-    if (!ok[id]) continue;
-    int g = constrain(raw[id], POS_MIN[id], POS_MAX[id]);
-    scs_moveToPos(id, g);
-    delayMicroseconds(1500);
-  }
-
-  // ③ 読めた軸だけトルクON（読めない軸は脱力のまま＝跳ね防止）
-  for (int id = 0; id < 8; id++) {
-    if (!ok[id]) continue;
-    scs_setTorque(id, true);
-    delayMicroseconds(1500);
-  }
-
+  int raw[8]; bool ok[8];
+  for (int id=0; id<8; id++) ok[id]=scs_readPosition(id, raw[id]);
+  for (int id=0; id<8; id++) { if(!ok[id])continue; scs_moveToPos(id, constrain(raw[id],POS_MIN[id],POS_MAX[id])); delayMicroseconds(1500); }
+  for (int id=0; id<8; id++) { if(!ok[id])continue; scs_setTorque(id,true); delayMicroseconds(1500); }
   torqueOn = true;
-  Serial.printf("torqueOnNoJerk: %d/8 enabled\n", nok);
-  char buf[24];
-  snprintf(buf, sizeof(buf), "ON %d/8", nok);
-  drawStatus(buf);
+}
+
+// 現在位置キャッシュ更新（読めた軸だけ更新、失敗は前回値を保持）
+void refreshCache() {
+  for (int id=0; id<8; id++) {
+    int r;
+    curOk[id] = scs_readPosition(id, r);
+    if (curOk[id]) curRaw[id] = r;
+  }
 }
 
 
-// ===== LCD =====
-// トルク状態ヘッダ（緑=ON / オレンジ=OFF）
-void drawHeader() {
+// ===== キーフレーム =====
+void recordFrame() {
+  if (frameCount >= MAX_FRAMES) return;
+  for (int id=0; id<8; id++) {
+    int r;
+    frames[frameCount][id] = scs_readPosition(id, r) ? (uint16_t)r
+                                                     : (uint16_t)curRaw[id];  // 失敗は直近キャッシュ
+  }
+  frameTransMs[frameCount] = defTransMs;   // 新規コマは既定の移行時間で初期化（後で個別調整可）
+  frameCount++;
+  Serial.printf("record: frame %d\n", frameCount);
+}
+
+void undoFrame()  { if (frameCount>0) frameCount--; }
+void clearFrames(){ frameCount = 0; }
+
+// 指定コマを削除して後ろを詰める
+void deleteFrame(int idx) {
+  if (idx<0 || idx>=frameCount) return;
+  for (int i=idx; i<frameCount-1; i++) {
+    memcpy(frames[i], frames[i+1], sizeof(frames[i]));
+    frameTransMs[i] = frameTransMs[i+1];
+  }
+  frameCount--;
+}
+
+// 再生開始（ノンブロッキング）。現在位置→frame0→frame1→… をLinearで。開始は無ジャーク。
+void startPlay() {
+  if (frameCount < 1 || playing) return;
+  for (int id=0; id<8; id++) { int r; playFrom[id] = scs_readPosition(id,r) ? (uint16_t)r : (uint16_t)(511+offset[id]); }
+  // 現在位置をゴールに書いてからトルクON（無ジャーク）
+  for (int id=0; id<8; id++) { scs_moveToPos(id, constrain(playFrom[id],POS_MIN[id],POS_MAX[id])); delayMicroseconds(1500); }
+  setTorqueAll(true);
+  playSeg = 0; playStep = 0;
+  playSteps = frameTransMs[0] / PLAY_STEP_MS; if (playSteps < 1) playSteps = 1;
+  playing = true; playLast = millis();
+}
+
+// 再生を1ステップ進める（loopから毎回呼ぶ。PLAY_STEP_MS間隔で実行）。
+void tickPlay() {
+  if (!playing) return;
+  if (millis() - playLast < PLAY_STEP_MS) return;
+  playLast = millis();
+  playStep++;
+  for (int id=0; id<8; id++) {
+    int p = (int)playFrom[id] + ((int)frames[playSeg][id]-(int)playFrom[id]) * playStep / playSteps;
+    p = constrain(p, POS_MIN[id], POS_MAX[id]);
+    scs_moveToPos(id, p); delayMicroseconds(1500);
+  }
+  if (playStep >= playSteps) {            // この区間完了 → 次コマへ
+    for (int id=0; id<8; id++) playFrom[id] = frames[playSeg][id];
+    playSeg++;
+    if (playSeg >= frameCount) { playing = false; return; }
+    playStep = 0;
+    playSteps = frameTransMs[playSeg] / PLAY_STEP_MS; if (playSteps < 1) playSteps = 1;
+  }
+}
+
+void stopPlay() { playing = false; }
+
+
+// ===== LCD（確認用。詳細はiPad） =====
+void drawLcd() {
+  M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(torqueOn ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
   M5.Display.setCursor(2, 2);
-  M5.Display.print(torqueOn ? "TORQUE ON " : "TORQUE OFF");
+  M5.Display.print(torqueOn ? "TRQ ON" : "TRQ OFF");
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+  M5.Display.setCursor(2, 24);
+  M5.Display.print(apIp.toString());
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.setCursor(2, 38);
+  M5.Display.printf("frames:%d", frameCount);
+  for (int id=0; id<8; id++) {
+    int xx = 2 + (id/4)*66, yy = 54 + (id%4)*16;
+    M5.Display.setCursor(xx, yy);
+    if (curOk[id]) M5.Display.printf("%d:%4d", id, curRaw[id]);
+    else           M5.Display.printf("%d:----", id);
+  }
 }
 
-void drawStatus(const char* line2) {
-  M5.Display.fillScreen(TFT_BLACK);
-  drawHeader();
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(2, 30);
-  M5.Display.print("Phase0 verify");
-  M5.Display.setCursor(2, 50);
-  M5.Display.print(line2);
+
+// ===== Web =====
+void handleStatus() {
+  String j = "{\"torque\":"; j += (torqueOn ? "true" : "false");
+  j += ",\"frames\":"; j += frameCount;
+  j += ",\"defMs\":"; j += defTransMs;
+  j += ",\"playing\":"; j += (playing ? "true" : "false");
+  j += ",\"playIdx\":"; j += (playing ? playSeg : -1);
+  j += ",\"raw\":[";  for(int i=0;i<8;i++){ if(i)j+=","; j+=curRaw[i]; }
+  j += "],\"ok\":[";  for(int i=0;i<8;i++){ if(i)j+=","; j+=(curOk[i]?"1":"0"); }
+  j += "],\"fr\":[";
+  for (int i=0;i<frameCount;i++) {
+    if(i) j+=",";
+    j += "{\"t\":"; j += frameTransMs[i]; j += ",\"r\":[";
+    for(int k=0;k<8;k++){ if(k)j+=","; j+=frames[i][k]; }
+    j += "]}";
+  }
+  j += "]}";
+  server.send(200, "application/json", j);
+}
+
+void handleTorqueOff() { setTorqueAll(false); server.send(200,"text/plain","ok"); }
+void handleTorqueOn()  { torqueOnNoJerk();    server.send(200,"text/plain","ok"); }
+void handleRecord()    { recordFrame();       server.send(200,"text/plain","ok"); }
+void handleUndo()      { undoFrame();          server.send(200,"text/plain","ok"); }
+void handleClear()     { clearFrames();        server.send(200,"text/plain","ok"); }
+void handlePlay()      { startPlay();           server.send(200,"text/plain","ok"); }
+void handleStop()      { stopPlay();            server.send(200,"text/plain","ok"); }
+
+// 現在のシーケンスを自己完結JSONでダウンロード（Python解析・参照ライブラリ用）。
+// 較正offset・L1/L2・符号規則を同梱するので、これ単体で raw→角度→脚先 まで再現できる。
+void handleExport() {
+  String j = "{\"name\":\"current\",\"defMs\":"; j += defTransMs;
+  j += ",\"calib\":{\"offset\":[";
+  for(int i=0;i<8;i++){ if(i)j+=","; j+=offset[i]; }
+  j += "],\"L1\":50.0,\"L2\":65.0,\"sign\":\"RL/FR:+ , RR/FL:-\"}";
+  j += ",\"frames\":[";
+  for(int i=0;i<frameCount;i++){
+    if(i)j+=",";
+    j += "{\"t\":"; j += frameTransMs[i]; j += ",\"raw\":[";
+    for(int k=0;k<8;k++){ if(k)j+=","; j+=frames[i][k]; }
+    j += "]}";
+  }
+  j += "]}";
+  server.sendHeader("Content-Disposition", "attachment; filename=robot0009_seq.json");
+  server.send(200, "application/json", j);
+}
+void handleTransM()    { if(defTransMs>100) defTransMs-=100; server.send(200,"text/plain","ok"); }
+void handleTransP()    { if(defTransMs<5000) defTransMs+=100; server.send(200,"text/plain","ok"); }
+// 各コマの移行時間 ±（クエリ i= でコマ番号指定）
+void handleFrameTransM() { int i=server.arg("i").toInt(); if(i>=0&&i<frameCount&&frameTransMs[i]>100)  frameTransMs[i]-=100; server.send(200,"text/plain","ok"); }
+void handleFrameTransP() { int i=server.arg("i").toInt(); if(i>=0&&i<frameCount&&frameTransMs[i]<5000) frameTransMs[i]+=100; server.send(200,"text/plain","ok"); }
+void handleDeleteFrame() { deleteFrame(server.arg("i").toInt()); server.send(200,"text/plain","ok"); }
+
+void handleRoot() {
+  String h = "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>";
+  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<title>robot0009 Teaching</title><style>";
+  h += "body{font-family:sans-serif;text-align:center;margin:0;padding:10px;font-size:18px;}";
+  h += "h2{margin:6px;} .trq{font-size:24px;font-weight:bold;padding:6px;border-radius:8px;}";
+  h += ".on{background:#19d219;color:#fff;} .off{background:#ff9800;color:#fff;}";
+  h += "table{margin:8px auto;border-collapse:collapse;} td{border:1px solid #ccc;padding:6px 10px;font-variant-numeric:tabular-nums;}";
+  h += "button{font-size:18px;font-weight:bold;margin:5px;padding:12px 16px;border-radius:10px;border:1px solid #888;}";
+  h += ".rec{background:#3a7bff;color:#fff;} .play{background:#19d219;color:#fff;} .danger{background:#ffd2d2;} .calib{background:#e0e0e0;}";
+  h += ".sm{font-size:14px;padding:6px 10px;margin:2px;}";
+  h += ".fr{border:1px solid #ccc;border-radius:8px;margin:6px auto;padding:6px;max-width:460px;}";
+  h += ".fr small{color:#666;font-variant-numeric:tabular-nums;}";
+  h += ".now{border:3px solid #19d219;background:#eaffea;}";       // 再生中コマの強調枠
+  h += ".nowtag{color:#19d219;font-weight:bold;margin-left:6px;}"; // ▶再生中タグ
+  h += ".exp{background:#fff3c2;}";
+  h += ".sel{outline:4px solid #1565c0;box-shadow:0 0 0 4px #90caf9;}"; // 有効中ボタンの強調
+  h += "button:active{filter:brightness(.82);transform:scale(.96);}";   // 押下フィードバック
+  h += "</style></head><body>";
+  h += "<h2>robot0009 Teaching</h2>";
+  h += "<div id='trq' class='trq'>...</div>";
+  h += "<p>新規コマの既定移行 <button class='sm' onclick=\"act('/transM')\">-</button><b id='tm'>0</b>ms<button class='sm' onclick=\"act('/transP')\">+</button></p>";
+  h += "<table id='tbl'></table>";
+  h += "<p><button id='bOff' class='calib' onclick=\"act('/torqueOff')\">脱力(OFF)</button>";
+  h += "<button id='bOn' class='calib' onclick=\"act('/torqueOn')\">保持(無ジャークON)</button></p>";
+  h += "<p><button class='rec' onclick=\"act('/record')\">このコマを記録</button>";
+  h += "<button class='danger' onclick=\"act('/undo')\">最後を削除</button>";
+  h += "<button class='danger' onclick=\"if(confirm('全消去?'))act('/clear')\">全消去</button></p>";
+  h += "<p><button id='bPlay' class='play' onclick=\"if(confirm('再生します。手で押さえて下さい'))act('/play')\">▶ 再生</button>";
+  h += "<button class='danger' onclick=\"act('/stop')\">■ 停止</button>";
+  h += "<button class='exp' onclick=\"location.href='/export'\">⬇ エクスポート(JSON)</button></p>";
+  h += "<h3>コマ一覧</h3><div id='list'></div>";
+  h += "<script>";
+  h += "const LBL=['RL肩','RR肩','RL膝','RR膝','FR肩','FL肩','FR膝','FL膝'];";
+  h += "async function act(p){await fetch(p,{method:'POST'});poll();}";
+  h += "async function poll(){try{let j=await(await fetch('/status')).json();";
+  h += "let t=document.getElementById('trq');t.textContent=j.torque?'TORQUE ON':'TORQUE OFF';t.className='trq '+(j.torque?'on':'off');";
+  h += "document.getElementById('bOff').className='calib'+(!j.torque?' sel':'');";   // 脱力中=強調
+  h += "document.getElementById('bOn').className='calib'+(j.torque?' sel':'');";      // 保持中=強調
+  h += "document.getElementById('bPlay').className='play'+(j.playing?' sel':'');";    // 再生中=強調
+  h += "document.getElementById('fc')&&(document.getElementById('fc').textContent=j.frames);document.getElementById('tm').textContent=j.defMs;";
+  h += "let s='<tr><td>ID</td><td>部位</td><td>現在raw</td></tr>';";
+  h += "for(let i=0;i<8;i++){s+='<tr><td>'+i+'</td><td>'+LBL[i]+'</td><td>'+(j.ok[i]?j.raw[i]:'--')+'</td></tr>';}";
+  h += "document.getElementById('tbl').innerHTML=s;";
+  h += "let f='';for(let i=0;i<j.fr.length;i++){let fr=j.fr[i];";
+  h += "let now=(j.playing&&i==j.playIdx);";
+  h += "f+=\"<div class='fr\"+(now?' now':'')+\"'><b>コマ\"+(i+1)+\"</b>\"+(now?\"<span class='nowtag'>▶再生中</span>\":'')+\" 移行 <button class='sm' onclick=\\\"act('/frameTransM?i=\"+i+\"')\\\">-</button>\"+fr.t+\"ms<button class='sm' onclick=\\\"act('/frameTransP?i=\"+i+\"')\\\">+</button> \";";
+  h += "f+=\"<button class='danger sm' onclick=\\\"act('/deleteFrame?i=\"+i+\"')\\\">削除</button><br><small>\"+fr.r.join(' ')+\"</small></div>\";}";
+  h += "document.getElementById('list').innerHTML=f;}catch(e){}}";
+  h += "setInterval(poll,300);poll();";
+  h += "</script></body></html>";
+  server.send(200, "text/html", h);
 }
