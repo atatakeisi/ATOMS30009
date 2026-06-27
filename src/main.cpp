@@ -1240,10 +1240,17 @@ bool scs_readPosition(byte id, int &outRaw) {
   for (int i = 0; i < 8; i++) Serial1.write(req[i]);
   Serial1.flush();  // 送信完了まで待つ
 
+  // ★ 自己エコー対策の核心（実機ダンプで確定）：送信した8byteは必ずRXに返る。
+  //   READ要求のエコーは応答用checksum式 ~(id+len+err+dataL+dataH) を偶然満たし
+  //   0x238=568 を返してしまうため、ヘッダ＋checksumでは区別できない。
+  //   よって先に8byteを「バイト数で」確実に読み捨ててから応答を探す。
+  int skipped = 0;
+  unsigned long te = millis();
+  while (skipped < 8 && millis() - te < 20) {
+    if (Serial1.available()) { Serial1.read(); skipped++; }
+  }
+
   // ヘッダ(FF FF)を探索しながら応答を受信する。
-  // 自己エコー（送信した8byte）も FF FF で始まるため、ヘッダ直後の
-  // [id][len] が応答フォーマット（len=0x04）かつchecksum一致するもののみ採用。
-  // 単純化のため、ヘッダ探索→8byte読み→検証 を取りこぼしなく行う。
   unsigned long start = millis();
   int state = 0;            // FF FF 検出用ステート
   while (millis() - start < 20) {
@@ -1268,18 +1275,21 @@ bool scs_readPosition(byte id, int &outRaw) {
     }
     if (got < 5) return false;  // タイムアウト
 
-    byte len   = rest[0];
-    byte err   = rest[1];
-    byte dataL = rest[2];
-    byte dataH = rest[3];
-    byte rcs   = rest[4];
+    // 応答: FF FF id len err posH posL cs
+    // ★位置は上位バイト先＝big-endian（WRITEと同じ並び。実機ダンプで確定。
+    //   プロンプト元仕様の「low byte first」は誤りだった）
+    byte len  = rest[0];
+    byte err  = rest[1];
+    byte posH = rest[2];
+    byte posL = rest[3];
+    byte rcs  = rest[4];
 
-    // 自己エコー（要求パケット FF FF id 04 02 38 02 cs）は
-    // len=0x04 だが続きが 02 38 ... のため checksum が合わない。
-    // READ応答の checksum = (~(id + len + error + dataL + dataH)) & 0xFF
-    byte calc = (~(rid + len + err + dataL + dataH)) & 0xFF;
+    // READ応答の checksum = (~(id + len + error + posH + posL)) & 0xFF
+    byte calc = (~(rid + len + err + posH + posL)) & 0xFF;
     if (rid == id && len == 0x04 && calc == rcs) {
-      outRaw = dataL | (dataH << 8);  // low byte first
+      int v = (posH << 8) | posL;
+      if (v < 0 || v > 1023) return false;  // 範囲外＝フレーム不正として弾く
+      outRaw = v;
       return true;
     }
 
