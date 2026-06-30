@@ -6,6 +6,7 @@
 #include <Kalman.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include "motions/motions_all.h"   // Teaching動作（手作り→変換した動きのレジストリ）
 
 #define TX_PIN 5
 // サーボバスのRX。HW改造でGPIO6を追加（TX側に1kΩ直列、RXはバス直結）。
@@ -60,6 +61,10 @@ constexpr int Advance = 7;
 constexpr int Back = 8;
 constexpr int Roll = 9;
 constexpr int Calib = 10;   // キャリブレーション（全サーボを角度0=511+offsetで保持）
+constexpr int PlayMotion = 11;  // Teaching動作の再生（curMotionを1回再生して通常へ戻る）
+
+// 再生対象のTeaching動作（Webボタンで選択）。nullptr=なし。
+const Motion* curMotion = nullptr;
 
 // キャリブレーション対象サーボ（0..7）
 int calSel = 0;
@@ -105,6 +110,7 @@ int servoSpeed = 200;
 void scs_moveToPos(byte id, int position);
 bool scs_readPosition(byte id, int &outRaw);
 void softStartToHorizontal();
+void playMotion(const Motion& m);
 void servo_write(int ch, float ang);
 void fRIK(float x, float z);
 void fLIK(float x, float z);
@@ -228,6 +234,16 @@ void handleRoot() {
 
     // 水平維持（IMU）はパッド外
     temp += formBtn("/imu","水平維持（IMU）", String("bal ")+modeBtImu);
+
+    // Teaching動作（手作り→変換した動き）。POSTでインデックス送信、loopが1回再生。
+    if(N_MOTIONS > 0){
+      temp +="<hr><b>Teaching動作</b><br>";
+      for(int i = 0; i < N_MOTIONS; i++){
+        temp +="<form method='post' action='/motion' style='display:inline;margin:0'>";
+        temp +="<input type='hidden' name='n' value='" + String(i) + "'>";
+        temp +="<button class='walk'>" + String(ALL_MOTIONS[i]->name) + "</button></form>";
+      }
+    }
 
     // 歩行調整（動作群の下）
     temp +="<hr><b>歩行調整</b><br>";
@@ -455,6 +471,16 @@ void handleCalReset() { offset[calSel] = 0; saveOffset(calSel); handleRoot(); }
 void handleCalibMode() { Mode = Calib; handleRoot(); }  // 全サーボ水平保持
 void handleStandMode() { Mode = 0;     handleRoot(); }  // IKによる立ち姿勢
 
+// Teaching動作の再生要求。POST引数 n=動作インデックス。
+void handleMotion() {
+  int n = server.arg("n").toInt();
+  if(n >= 0 && n < N_MOTIONS){
+    curMotion = ALL_MOTIONS[n];
+    Mode = PlayMotion;   // loopが1回再生してMode=0へ戻す
+  }
+  handleRoot();
+}
+
 void handleSpeedM() {  // 遅く（より安全）
   if(servoSpeed > 20){ servoSpeed -= 20; preferences.putInt("servoSpeed", servoSpeed); }
   handleRoot();
@@ -625,6 +651,7 @@ const char* modeName() {
     case Back:    return "Back";
     case Roll:    return "Roll";
     case Calib:   return "CALIB";
+    case PlayMotion: return curMotion ? curMotion->name : "MOTION";
     default:      return "Stand";
   }
 }
@@ -769,6 +796,7 @@ void setup() {
   // キャリブレーション
   server.on("/calMode", HTTP_POST, handleCalibMode);
   server.on("/standMode", HTTP_POST, handleStandMode);
+  server.on("/motion", HTTP_POST, handleMotion);   // Teaching動作の再生
   server.on("/speedM", HTTP_POST, handleSpeedM);
   server.on("/speedP", HTTP_POST, handleSpeedP);
   server.on("/resetParams", HTTP_POST, handleResetParams);
@@ -847,6 +875,9 @@ void loop() {
       servo_write(i, 0);
     }
     delay(20);
+  }else if(Mode == PlayMotion){ //Teaching動作を1回再生して通常へ戻る
+    if(curMotion) playMotion(*curMotion);
+    Mode = 0;
   }else if(Mode == Jump){ //ジャンプ
     fRIK(20, 35);
     fLIK(20, 35);
@@ -1336,6 +1367,38 @@ void softStartToHorizontal() {
     delay(STEP_DELAY);  // ステップ間の待ち（既存ペーシングとは別）
   }
   Serial.println("softStart: done");
+}
+
+
+// Teaching動作の再生。現在位置→frame0→frame1→… を各コマのtoMsでLinear補間。
+// raw値を直接 scs_moveToPos へ渡す（IK/pos反転は通さない＝記録時の絶対姿勢を再現）。
+// softStartと同じ「ステップ外/サーボ内・1.5msペーシング」。loop内から1回呼ぶ想定（ブロッキング）。
+void playMotion(const Motion& m) {
+  if (m.count == 0) return;
+  const int STEP_DELAY = 15;  // ステップ間ms
+
+  // 開始点＝現在位置（読めなければ水平）。先頭コマへ滑らかに入る。
+  int from[8];
+  for (int id = 0; id < 8; id++) {
+    int raw = 0;
+    from[id] = scs_readPosition(id, raw) ? raw : (511 + offset[id]);
+  }
+
+  for (int f = 0; f < m.count; f++) {
+    const uint16_t* to = m.frames[f].raw;
+    int dur = m.frames[f].toMs;
+    int steps = dur / STEP_DELAY; if (steps < 1) steps = 1;
+    for (int s = 1; s <= steps; s++) {
+      for (int id = 0; id < 8; id++) {
+        int p = from[id] + ((int)to[id] - from[id]) * s / steps;
+        p = constrain(p, POS_MIN[id], POS_MAX[id]);
+        scs_moveToPos(id, p);
+        delayMicroseconds(1500);
+      }
+      delay(STEP_DELAY);
+    }
+    for (int id = 0; id < 8; id++) from[id] = to[id];
+  }
 }
 
 
