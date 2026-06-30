@@ -72,6 +72,11 @@ int calSel = 0;
 // 画面切替：false=操作ビュー / true=準備設定ビュー（速度・個別サーボ調整）
 bool setupView = false;
 
+// 起動時に水平へ寄せ終えた軸か。softStartでREAD成功→ランプ済みの軸はtrue。
+// READに失敗して放置した軸はfalseのまま。Calibループはtrueの軸だけを水平保持し、
+// falseの軸は「読めるようになったら一度だけ滑らかに寄せる」（＝跳ね上げを封じる）。
+bool g_atHorizontal[8] = {false,false,false,false,false,false,false,false};
+
 // IDごとの想定マッピング（実機で検証する）。表示用ラベル。
 const char* servoLabel(int id){
   switch(id){
@@ -110,6 +115,7 @@ int servoSpeed = 200;
 void scs_moveToPos(byte id, int position);
 bool scs_readPosition(byte id, int &outRaw);
 void softStartToHorizontal();
+static void softApproachToHorizontal(int id, int fromRaw);
 void playMotion(const Motion& m);
 void servo_write(int ch, float ang);
 void fRIK(float x, float z);
@@ -872,7 +878,17 @@ void loop() {
 
   if(Mode == Calib){ //キャリブレーション：全サーボをセンター(511+offset)で保持
     for(int i = 0; i < 8; i++){
-      servo_write(i, 0);
+      if(g_atHorizontal[i]){
+        servo_write(i, 0);   // 水平済みの軸は通常どおり保持
+      }else{
+        // 起動時に読めなかった軸：いきなり水平へ駆動すると跳ねるので、
+        // 読めるようになった時だけ一度だけ滑らかに寄せる。読めない間は触らない。
+        int raw;
+        if(scs_readPosition(i, raw)){
+          softApproachToHorizontal(i, raw);
+          g_atHorizontal[i] = true;
+        }
+      }
     }
     delay(20);
   }else if(Mode == PlayMotion){ //Teaching動作を1回再生して通常へ戻る
@@ -1331,33 +1347,71 @@ bool scs_readPosition(byte id, int &outRaw) {
 }
 
 
+// コールドブート対策パラメータ：筐体スイッチだと本体とサーボが同時通電するため、
+// softStart実行時にサーボ側MCUがまだREAD応答を返せず、全軸READ失敗→水平へ直行
+// （＝跳ね上げ）が起きていた。起動待ち＋リトライで「真の現在位置」を確実に取得する。
+static const int SERVO_WARMUP_MS = 600;  // 通電後サーボが応答可能になるまでの待ち
+static const int READ_RETRY      = 8;    // 1軸あたりのREAD再試行回数
+static const int READ_RETRY_MS   = 15;   // 再試行間隔
+
+// READを複数回試す（起き切るまで取りこぼすため）。1回でも成功すればtrue。
+static bool scs_readPositionRetry(byte id, int &outRaw) {
+  for (int t = 0; t < READ_RETRY; t++) {
+    if (scs_readPosition(id, outRaw)) return true;
+    delay(READ_RETRY_MS);
+  }
+  return false;
+}
+
+// 起動後に遅れて読めるようになった軸を、現在raw→水平へブロッキングで滑らかに寄せる。
+// Calibブランチから「起動時に読めなかった軸」用に一度だけ呼ぶ（跳ねさせないため）。
+static void softApproachToHorizontal(int id, int fromRaw) {
+  const int STEPS = 20;
+  const int STEP_DELAY = 30;  // 20step×30ms ≒ 600ms
+  int target = constrain(511 + offset[id], POS_MIN[id], POS_MAX[id]);
+  for (int s = 1; s <= STEPS; s++) {
+    int p = fromRaw + (target - fromRaw) * s / STEPS;
+    p = constrain(p, POS_MIN[id], POS_MAX[id]);
+    scs_moveToPos(id, p);
+    delay(STEP_DELAY);
+  }
+}
+
 // 起動時のソフトスタート：各サーボの現在位置を読み取り、そこから水平姿勢
 // (511+offset[id]) へ約20ステップ・合計800〜1000msかけてゆっくり補間移動する。
-// 読み取りに失敗したサーボは目標rawをそのまま使う（=ランプせずスキップ）。
+// ★READに失敗した軸は teach の無ジャークONと同じく「一切動かさない」（=水平へ直行
+//   させない）。始点不明のままスナップさせるのが従来の跳ね上げ原因だった。
+//   起動待ち＋リトライで通常は全軸READ成功するので、その軸はランプで滑らかに水平へ。
 // ステップのループを外側、サーボのループを内側にして全軸を同期して動かす。
 void softStartToHorizontal() {
   const int STEPS = 20;
   const int STEP_DELAY = 45;  // ms。20step×45ms ≒ 900ms
   int startRaw[8];
   int targetRaw[8];
+  bool haveStart[8];  // この軸の現在位置を読めたか（読めた軸だけランプ＝動かす）
+
+  // (1) サーボ起動待ち。同時通電直後はREAD応答を返せないため、ここで待つ。
+  delay(SERVO_WARMUP_MS);
 
   Serial.println("softStart: read current positions");
   for (int id = 0; id < 8; id++) {
     targetRaw[id] = constrain(511 + offset[id], POS_MIN[id], POS_MAX[id]);
     int raw = 0;
-    if (scs_readPosition(id, raw)) {
-      startRaw[id] = raw;
+    if (scs_readPositionRetry(id, raw)) {
+      startRaw[id]  = raw;
+      haveStart[id] = true;
       Serial.printf("  ID%d read OK  raw=%d  target=%d\n", id, raw, targetRaw[id]);
     } else {
-      // 失敗：目標値を始点にして、このサーボはランプしない
-      startRaw[id] = targetRaw[id];
-      Serial.printf("  ID%d read FAIL -> skip ramp (use target=%d)\n", id, targetRaw[id]);
+      // ★読めない軸は動かさない（現在の保持姿勢のまま）。水平へ直行＝跳ね上げを封じる。
+      haveStart[id] = false;
+      Serial.printf("  ID%d read FAIL -> leave as-is (no snap)\n", id);
     }
   }
 
   Serial.println("softStart: ramp to horizontal");
   for (int s = 1; s <= STEPS; s++) {
     for (int id = 0; id < 8; id++) {
+      if (!haveStart[id]) continue;  // 読めなかった軸はランプしない（teachと同じ扱い）
       // 現在raw → 目標raw を線形補間
       int posRaw = startRaw[id] + (targetRaw[id] - startRaw[id]) * s / STEPS;
       posRaw = constrain(posRaw, POS_MIN[id], POS_MAX[id]);
@@ -1366,6 +1420,11 @@ void softStartToHorizontal() {
     }
     delay(STEP_DELAY);  // ステップ間の待ち（既存ペーシングとは別）
   }
+
+  // ランプし終えた（=現在位置を読めた）軸だけ「水平済み」とする。
+  // 読めなかった軸はfalseのままにして、Calibループが後で滑らかに寄せる。
+  for (int id = 0; id < 8; id++) g_atHorizontal[id] = haveStart[id];
+
   Serial.println("softStart: done");
 }
 
