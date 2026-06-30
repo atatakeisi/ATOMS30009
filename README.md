@@ -4,8 +4,38 @@ M5Stack ATOM S3 と SCS0009 サーボ8軸による四足歩行ロボット。
 WiFi アクセスポイント + ブラウザ(HTTP)でリアルタイム制御する。
 2リンク逆運動学(IK)で各脚を制御し、内蔵IMU(MPU6886)で表裏判定・姿勢制御を行う。
 
-> このドキュメントは **現在の `src/main.cpp` の構成** を一から記述したもの。
+> このドキュメントは **現在の本番ファーム([src/prod/main.cpp](src/prod/main.cpp))の構成** を一から記述したもの。
 > 過去の別設計(WebSocket版・サーボグループ版など)とは無関係。
+
+---
+
+## リポジトリ構成（どこに何があるか）
+
+```
+ATOMS30009/
+├─ src/              ■ファームウェア（→ src/README.md）
+│   ├─ prod/         ●本番（筐体専用）ファーム  AP: robot0009
+│   ├─ teach/        ●Teaching工房ファーム      AP: robot0009-teach
+│   └─ motions/      ●手作り動きの自動生成ヘッダ
+├─ analysis/         ■Python：手作り動き→本編ボタン変換、将来の力学解析（→ analysis/README.md）
+│   └─ sequences/    手作り動きJSON（参照ライブラリ）
+├─ hardware/         ■ハード資料：配線・3Dプリント（→ hardware/README.md）
+│   └─ 3d-models/    3Dデータ（.stl/.3mf。作業中につき当面未コミット）
+├─ tools/            ■ユーティリティ：サーボID設定・単体テスト（→ tools/README.md）
+├─ docs/             ■ドキュメント（→ docs/README.md）
+│   ├─ DESIGN.md     進化プロジェクト設計・ロードマップ
+│   ├─ ui/           WebUIスクショ
+│   └─ original/     移植元.ino＋移植プロンプト
+├─ platformio.ini    env: m5stack-atoms3(prod) / m5stack-atoms3-teach(teach)
+└─ README.md         このファイル（本番ファームの詳細仕様）
+```
+
+| やりたいこと | 見る場所 |
+|---|---|
+| 本番ファームの仕様 | このREADME 以降 |
+| ビルド/書き込み・ファーム区分 | [src/README.md](src/README.md) |
+| 手作り動きを本編ボタンに追加 | [analysis/README.md](analysis/README.md) |
+| 進化プロジェクトの設計全体 | [docs/DESIGN.md](docs/DESIGN.md) |
 
 ---
 

@@ -3,6 +3,7 @@
 // 全Teaching動作のレジストリ。prodはこれをincludeしてボタン生成＋再生する。
 #include "motion.h"
 #include "home.h"
+#include "zenten.h"
 
-static const Motion* const ALL_MOTIONS[] = { &home_motion };
+static const Motion* const ALL_MOTIONS[] = { &home_motion, &zenten_motion };
 static const int N_MOTIONS = sizeof(ALL_MOTIONS)/sizeof(ALL_MOTIONS[0]);

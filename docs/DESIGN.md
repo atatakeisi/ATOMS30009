@@ -81,26 +81,29 @@
 
 ## プロジェクト構成（単一リポジトリ・多env）
 
+実際の構成（2026-06時点。整理済み）:
+
 ```
 ATOMS30009/
-├─ platformio.ini          # env: m5stack-atoms3(prod, 現行) / m5stack-atoms3-teach(新規)
-├─ src/
-│  ├─ main.cpp             # ← 現行 prod。Phase1〜4では一切触らない
-│  └─ teach/
-│     └─ main_teach.cpp    # Teaching/計測再生ファーム（独立 env）
-├─ data/                   # LittleFS イメージ（既定シーケンス等・Phase2以降）
-├─ analysis/               # Python（Mac mini, Phase4）
-│  ├─ requirements.txt
-│  ├─ robot/               # ik.py / zmp.py / io_http.py / schema.py
-│  └─ notebooks/
+├─ platformio.ini          # env: m5stack-atoms3(prod) / m5stack-atoms3-teach(teach)
+├─ src/                    # ファームウェア（PlatformIO規約）
+│  ├─ prod/main.cpp        # 本番（筐体専用）ファーム
+│  ├─ teach/main_teach.cpp # Teaching/計測再生ファーム（独立 env）
+│  └─ motions/             # 手作り動きの自動生成ヘッダ（motion.hのみ手書き）
+├─ analysis/               # Python（Mac mini）
+│  ├─ seq_to_header.py     # sequences/*.json → src/motions/*.h 変換
+│  └─ sequences/           # 手作り動きJSON（参照ライブラリ）
+├─ hardware/3d-models/     # 3Dプリントデータ（作業中につき当面未コミット）
+├─ tools/                  # servo-id-set（ID設定）/ servo-test（単体テスト）
 ├─ docs/
 │  ├─ DESIGN.md            # 本書
-│  └─ schema/keyframe.schema.json
-└─ shared/protocol.md      # SCS0009 プロトコルの単一情報源
+│  ├─ ui/                  # WebUIスクショ
+│  └─ original/            # 移植元.ino＋移植プロンプト
+└─ README.md               # 本番ファーム詳細＋リポジトリ構成マップ
 ```
 
-`build_src_filter` で prod は `src/main.cpp`、teach は `src/teach/` のみをビルド。
-**現行ファームのビルドは無改変**で温存する。
+`build_src_filter` で prod は `src/prod/`、teach は `src/teach/` のみをビルド。
+`src/motions/*.h` はヘッダなのでビルド対象外（prodが相対includeで取り込む）。
 
 ### コード重複の方針
 

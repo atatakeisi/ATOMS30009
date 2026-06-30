@@ -3,3 +3,9 @@
 *.o
 *.d
 .DS_Store
+*.bak
+
+# 3Dモデルは作業中＆容量のため当面コミットしない（後日 hardware/3d-models/ に追加）
+3Dmodel-0009/
+hardware/3d-models/*
+!hardware/3d-models/README.md

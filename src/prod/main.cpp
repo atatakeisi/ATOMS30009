@@ -6,7 +6,7 @@
 #include <Kalman.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include "motions/motions_all.h"   // Teaching動作（手作り→変換した動きのレジストリ）
+#include "../motions/motions_all.h"   // Teaching動作（手作り→変換した動きのレジストリ）
 
 #define TX_PIN 5
 // サーボバスのRX。HW改造でGPIO6を追加（TX側に1kΩ直列、RXはバス直結）。
